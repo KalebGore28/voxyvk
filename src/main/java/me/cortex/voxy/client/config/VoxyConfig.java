@@ -4,6 +4,7 @@ import com.google.gson.FieldNamingPolicy;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonParseException;
+import me.cortex.voxy.client.core.NormalRenderPipeline;
 import me.cortex.voxy.client.core.SSAO;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.util.cpu.CpuLayout;
@@ -32,7 +33,7 @@ public class VoxyConfig {
     public float sectionRenderDistance = 16;
     public int serviceThreads = (int) Math.max(CpuLayout.getCoreCount()/1.5, 1);
     public float subDivisionSize = 64;
-    public boolean useEnvironmentalFog = true;
+    public String fogMode;
     public boolean dontUseSodiumBuilderThreads = false;
     //Voxy's rendering API is not user-selectable: it follows whichever graphics
     // API MC itself is running on. When MC resolves to Vulkan, Voxy renders
@@ -47,14 +48,28 @@ public class VoxyConfig {
     public String ssaoMode;
 
     public SSAO.SSAOMode getSSAOMode() {
-        if (this.ssaoMode == null) return SSAO.SSAOMode.AUTO;
+        var DEFAULT = SSAO.SSAOMode.AUTO;
+        if (this.ssaoMode == null) return DEFAULT;
         try {
             return SSAO.SSAOMode.valueOf(this.ssaoMode.toUpperCase(Locale.ROOT));
-        } catch (Exception e) { return SSAO.SSAOMode.AUTO; }
+        } catch (Exception e) { return DEFAULT; }
     }
 
     public void setSSAOMode(SSAO.SSAOMode mode) {
         this.ssaoMode = mode.name().toLowerCase(Locale.ROOT);
+    }
+
+
+    public NormalRenderPipeline.FogMode getFogMode() {
+        var DEFAULT = NormalRenderPipeline.FogMode.FOG_AND_FADE;
+        if (this.fogMode == null) return DEFAULT;
+        try {
+            return NormalRenderPipeline.FogMode.valueOf(this.fogMode.toUpperCase(Locale.ROOT));
+        } catch (Exception e) { return DEFAULT;}
+    }
+
+    public void setFogMode(NormalRenderPipeline.FogMode mode) {
+        this.fogMode = mode.name().toLowerCase(Locale.ROOT);
     }
 
 

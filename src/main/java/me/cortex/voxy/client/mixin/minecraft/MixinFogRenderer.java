@@ -22,7 +22,8 @@ public class MixinFogRenderer {
         if (vrs == null) return;
         var data = cir.getReturnValue();
         boolean fogIsDamnClose = data.environmentalEnd<10;
-        if (!VoxyConfig.CONFIG.useEnvironmentalFog && !fogIsDamnClose) {
+        var mode = VoxyConfig.CONFIG.getFogMode();
+        if (mode.removesVanillaEnvFog && !fogIsDamnClose) {
             data.environmentalStart = 99999999;
             data.environmentalEnd = 99999999;
         }
