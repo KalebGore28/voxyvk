@@ -1,7 +1,9 @@
 plugins {
     id 'net.fabricmc.fabric-loom' version "${loom_version}"
     id 'maven-publish'
+    id "me.champeau.jmh" version "0.7.3"
 }
+
 def INCLUDE_OTHER_ARCHS = "true".equalsIgnoreCase(project.findProperty("includeOtherArchs"))
 
 def isInGHA = System.getenv("GITHUB_ACTIONS") == "true"
@@ -422,6 +424,12 @@ dependencies {
     }
     //implementation 'org.rocksdb:rocksdbjni:8.10.0'
     //implementation 'redis.clients:jedis:5.1.0'
+}
+
+
+jmh {
+    zip64 = true
+    //profilers = ["xperfasm"]
 }
 
 /*
