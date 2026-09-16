@@ -1,4 +1,9 @@
-name: manual-artifact
+name: Build Artifact (Development Only)
+
+# This workflow is for development testing only.
+# Due to "All Rights Reserved - Do not redistribute" license,
+# compiled binaries are NOT for public distribution.
+# Users must build from source themselves.
 
 on: [ workflow_dispatch ]
 jobs:
@@ -27,6 +32,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: voxy-artifacts
+          name: voxyvk-artifacts
           path: build/libs/*.jar
           archive: false

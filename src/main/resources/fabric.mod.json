@@ -1,19 +1,23 @@
 {
   "schemaVersion": 1,
-  "id": "voxy",
+  "id": "voxyvk",
   "version": "${version}",
   "custom": {
     "commit": "${commit}",
     "buildtime": "${buildtime}"
   },
-  "name": "Voxy",
-  "description": "Far distance rendering mod utilising LoDs",
+  "name": "VoxyVK",
+  "description": "Far distance rendering mod with Vulkan/MoltenVK support. Maintained fork of Voxy by MCRcortex (from PR-614).",
   "authors": [
-    "Cortex"
+    "MCRcortex (Original Author - All Rights Reserved)",
+    "KalebGore28 (Fork Maintainer)"
   ],
   "contact": {
+    "homepage": "https://github.com/KalebGore28/voxy-vulkan",
+    "issues": "https://github.com/KalebGore28/voxy-vulkan/issues",
+    "sources": "https://github.com/KalebGore28/voxy-vulkan"
   },
-  "license": "All-Rights-Reserved",
+  "license": "All-Rights-Reserved (Copyright © 2025 MCRcortex)",
   "icon": "assets/voxy/icon.png",
   "environment": "*",
   "entrypoints": {
