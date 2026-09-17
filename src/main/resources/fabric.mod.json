@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "id": "voxyvk",
+  "id": "voxy",
   "version": "${version}",
   "custom": {
     "commit": "${commit}",
