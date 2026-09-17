@@ -352,6 +352,11 @@ public class ModelFactory {
         public int biomeUploadIndex = -1;
         public @Nullable MemoryBuffer biomeUpload;
 
+        private ModelBakeResultUpload(boolean useMips) {
+            this.hasMips = useMips;
+            this.texture = new MemoryBuffer((2L*3*(useMips?computeSizeWithMips(MODEL_TEXTURE_SIZE):MODEL_TEXTURE_SIZE*MODEL_TEXTURE_SIZE))*4);
+        }
+
         public void upload(IModelStore store) {//Uploads and resets for reuse
             this.model.cpyTo(AbstractUploadStream.INSTANCE().upload(store.modelBufferHandle(), (long) this.modelId * MODEL_SIZE, MODEL_SIZE));
             if (this.biomeUploadIndex != -1) {

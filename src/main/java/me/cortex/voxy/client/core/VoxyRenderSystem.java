@@ -136,7 +136,6 @@ public class VoxyRenderSystem {
             this.worldIn = world;
 
             this.properties = RenderProperties.getRenderProperties();
-            this.visbleSectionStream = new StreamedBoundStore();
             var backendFactory = getRenderBackendFactory();
             {
                 this.modelService = new ModelBakerySubsystem(world.getMapper());
