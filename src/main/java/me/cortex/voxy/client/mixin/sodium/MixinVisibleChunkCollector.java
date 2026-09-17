@@ -12,9 +12,7 @@ import net.minecraft.core.SectionPos;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.Redirect;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(value = VisibleChunkCollector.class, remap = false)
 public class MixinVisibleChunkCollector {
@@ -32,8 +30,8 @@ public class MixinVisibleChunkCollector {
     private RenderRegion voxy$injectVisibleSectionGather(RenderRegionManager instance, int x, int y, int z) {
         var region = instance.getForChunk(x,y,z);
         VoxyRenderSystem vrs;
-        if (!IrisUtil.irisShadowActive() && (vrs = IVoxyRenderSystemHolder.getNullable()) != null && voxy$shouldUseForChunkBound(region, LocalSectionIndex.pack(x, y, z))) {
-            if (vrs.visbleSectionStream != null) vrs.visbleSectionStream.put(SectionPos.asLong(x,y,z));
+        if (!IrisUtil.irisShadowActive() && (vrs = IVoxyRenderSystemHolder.getNullable()) != null && vrs.visbleSectionStream != null && voxy$shouldUseForChunkBound(region, LocalSectionIndex.pack(x, y, z))) {
+            vrs.visbleSectionStream.put(SectionPos.asLong(x,y,z));
         }
         return region;
     }

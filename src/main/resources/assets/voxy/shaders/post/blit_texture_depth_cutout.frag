@@ -25,7 +25,6 @@ layout(location = 5) uniform vec4 fogColour;
 layout(location = 6) uniform vec4 fadeParams;
 #endif
 #endif
-#endif
 
 #import <voxy:util/depthutils.glsl>
 

@@ -2,11 +2,7 @@ package me.cortex.voxy.client.mixin.sodium;
 
 import com.mojang.blaze3d.buffers.GpuBuffer;
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
-import com.mojang.blaze3d.opengl.GlCommandEncoder;
-import com.mojang.blaze3d.opengl.GlRenderPass;
 import com.mojang.blaze3d.opengl.GlTextureView;
-import com.mojang.blaze3d.systems.RenderPass;
-import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.textures.GpuSampler;
 import me.cortex.voxy.client.VoxyClient;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
@@ -26,10 +22,6 @@ import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-
-import java.util.Collections;
-import java.util.Optional;
-import java.util.OptionalDouble;
 
 @Mixin(value = DefaultChunkRenderer.class, remap = false)
 public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {

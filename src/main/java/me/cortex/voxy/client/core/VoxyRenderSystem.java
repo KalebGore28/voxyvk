@@ -72,7 +72,7 @@ public class VoxyRenderSystem {
 
     private final RenderDistanceTracker renderDistanceTracker;
     private final BoundRenderer boundOutlineRenderer;
-    public StreamedBoundStore visbleSectionStream;//Sodium mixin fed; backend-neutral (GL creates here, VK core supplies its own)
+    public final StreamedBoundStore visbleSectionStream;//Sodium mixin fed; backend-neutral (GL creates here, VK core supplies its own)
     private @Nullable ColumnStreamedBoundStore columnStreamedBoundStore;//Only used when FREX is enabled
 
     private final ViewportSelector<?> viewportSelector;
@@ -136,6 +136,7 @@ public class VoxyRenderSystem {
             this.worldIn = world;
 
             this.properties = RenderProperties.getRenderProperties();
+            this.visbleSectionStream = new StreamedBoundStore();
             var backendFactory = getRenderBackendFactory();
             {
                 this.modelService = new ModelBakerySubsystem(world.getMapper());
@@ -331,7 +332,7 @@ public class VoxyRenderSystem {
         this.pipeline.preSetup(viewport);
 
         TimingStatistics.E.start();
-        if ((!VoxyClient.disableSodiumChunkRender())&&!IrisUtil.irisShadowActive()) {
+        if (this.visbleSectionStream != null && (!VoxyClient.disableSodiumChunkRender()) && !IrisUtil.irisShadowActive()) {
             if (VoxyClient.isFrexActive()!=(this.columnStreamedBoundStore!=null)) {
                 if (this.columnStreamedBoundStore == null) {
                     this.columnStreamedBoundStore = new ColumnStreamedBoundStore();
@@ -616,7 +617,9 @@ public class VoxyRenderSystem {
             }
 
             this.boundOutlineRenderer.free();
-            this.visbleSectionStream.free();
+            if (this.visbleSectionStream != null) {
+                this.visbleSectionStream.free();
+            }
             if (this.columnStreamedBoundStore != null) {
                 this.columnStreamedBoundStore.free();
                 this.columnStreamedBoundStore = null;
