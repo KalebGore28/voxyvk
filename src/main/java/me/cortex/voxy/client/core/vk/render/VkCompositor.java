@@ -96,7 +96,7 @@ public class VkCompositor {
         d.vertGlsl = VkShaderSource.load("voxy:post/fullscreen2.vert", VkShaderSource.defs().props(this.properties).build());
         d.fragGlsl = VkShaderSource.load("voxy:post/blit_texture_depth_cutout.frag", VkShaderSource.defs().props(this.properties)
                 .def("EMIT_COLOUR")
-                .defIf("USE_ENV_FOG", this.useEnvFog)
+                .defIf("HAS_FOG", this.useEnvFog)
                 .build());
         d.colorFormat = mcColorFormat;
         d.depthFormat = mcDepthFormat;

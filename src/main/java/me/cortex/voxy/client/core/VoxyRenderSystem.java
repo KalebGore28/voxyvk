@@ -495,7 +495,7 @@ public class VoxyRenderSystem {
         ).mulLocal(makeProjectionMatrix(nearVoxy, 16*3000));
     }*/
 
-    private static Matrix4f computeProjectionMat(RenderProperties properties, Matrix4fc base, float farPlane) {
+    public static Matrix4f computeProjectionMat(RenderProperties properties, Matrix4fc base, float farPlane) {
 
         //this jank is to capture the extra crap they inject like viewbobbing
         var rawMCProj = Minecraft.getInstance().gameRenderer.gameRenderState().levelRenderState.cameraRenderState.projectionMatrix;

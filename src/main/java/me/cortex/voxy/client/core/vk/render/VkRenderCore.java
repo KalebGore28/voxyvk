@@ -165,7 +165,8 @@ public class VkRenderCore {
             }
 
             var viewport = this.viewportSelector.getViewport();
-            var voxyProjection = VoxyRenderSystem.computeProjectionMat(this.properties, matrices.projection());
+            float farPlaneChunks = (VoxyConfig.CONFIG.sectionRenderDistance * 32 + 2) * ((float) Math.sqrt(3));
+            var voxyProjection = VoxyRenderSystem.computeProjectionMat(this.properties, matrices.projection(), farPlaneChunks*16);
             var fog = crs.fogData == null ? null : new FogParameters(
                     crs.fogData.color.x, crs.fogData.color.y, crs.fogData.color.z, crs.fogData.color.w,
                     crs.fogData.environmentalStart, crs.fogData.environmentalEnd,
