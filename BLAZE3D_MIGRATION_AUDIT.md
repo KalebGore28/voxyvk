@@ -16,15 +16,27 @@ Goal of the plan: make future Minecraft ports cheaper by leaning on Blaze3D wher
 1. **The Vulkan path is about 90% self-implemented raw Vulkan.** Blaze3D supplies the device, queue and handles, the frame's command buffer and its submission, MC's render-target views (colour, depth, lightmap, block atlas), and one semaphore-signal hook. Voxy does everything else itself: memory, buffers, images, samplers, GLSL→SPIR-V, pipelines, descriptors, barriers and layouts, uploads, readbacks, frame retirement and deferred destruction. That is 35 files and about 5,050 lines, with about 122 raw Vulkan call sites (63 distinct `vk*` functions), against about 25 Blaze3D touchpoints in 11 files.
 2. **"Fully on Blaze3D" isn't reachable on 26.2.** Blaze3D has no compute shaders, no storage buffers or images, no stencil, no indirect-count draws, no push constants and no array textures, and its Vulkan pipelines hardcode a `D32_SFLOAT` depth attachment. Of Voxy's 19 VK pipelines, 13 are compute and 0 of those can move. Of the 6 graphics pipelines, 2 can move once their inputs change: chunk bounds after small changes (step 4.1), composite after 5.1/5.2. A third (depth setup) could move if stencil masking is removed.
 3. **The porting risk isn't the raw Vulkan code, which uses a stable API.** It's the coupling to Blaze3D's **Vulkan-backend internals**: one private-field accessor, one inject into a private method, the `com.mojang.blaze3d.vulkan.*` classes, and about 11 unwritten behavioural contracts (for example, MC keeps every image in `GENERAL` layout and ends every operation with a full barrier). MC 26.2 labels this backend *"Prefer Vulkan (Experimental)"*, so these are the likeliest things to break next version.
-4. **A second maintenance cost is the GL/VK mirroring.** The VK path mirrors the GL path class for class (about 20 pairs, [§4.2](#42-glvk-duplicate-pairs)). Every upstream (`MCRcortex/voxy`) renderer change has to be ported twice; the recent `fix: update Vulkan code for fog …` commits are exactly this. Moving a pass onto Blaze3D's *public* API collapses its GL and VK twins into **one implementation that runs on both MC backends**, which is where Blaze3D adoption pays off most.
+4. **A second maintenance cost is the GL/VK mirroring.** The VK path mirrors the GL path class for class (about 20 pairs, [§4.2](#42-glvk-duplicate-pairs)). Upstream (`MCRcortex/voxy`) renderer changes merge into the GL classes automatically but have to be re-ported by hand into their VK twins; the recent `fix: update Vulkan code for fog …` commits are exactly this. With GL in maintenance mode ([Decisions](#decisions-2026-09-25)), the fork's own work goes into VK only and the GL twins stay frozen until GL is removed. What Blaze3D adoption buys is a VK path that leans on MC's public API instead of its internals, which is what keeps ports cheap.
 5. **Recommended order:**
    - Phase 0: fence the internals into one adapter and write the contracts down (no behaviour change).
    - Phase 1: swap private hooks for the public ones MC itself uses (`execute()`, `createFence()`, `queueForDestroy()`, VMA).
-   - Phase 2: move small backend-neutral pieces (GPU timing, device info, atlas readback).
+   - Phase 2: move small pieces onto the public Blaze3D API, VK first (async atlas readback, GPU timing, device info).
    - Phase 3: create textures through Blaze3D.
    - Phase 4: pilot a Blaze3D `RenderPass` with the chunk-bounds renderer, then the composite pass.
    - Phase 5: decide on stencil-free masking and fragment SSAO, which gate any further moves.
    - Compute, traversal and terrain raster stay raw Vulkan until Mojang adds the missing features ([§6](#6-watchlist--blaze3d-features-that-would-unlock-more)).
+
+---
+
+## Decisions (2026-09-25)
+
+- **The OpenGL backend is in maintenance mode.** MC will eventually drop OpenGL, and Voxy's GL backend goes with it.
+  - Until then, GL only gets bug fixes, upstream merges, and the small seam adapters a VK/Blaze3D step needs.
+  - No drastic GL rewrites unless they directly advance the Vulkan path or the Blaze3D migration.
+  - Blaze3D-based replacements target the VK path. Switching GL over to one is optional, and only when it's a true drop-in.
+  - GL is still MC 26.2's *default* backend, so it has to keep working: changes to shared code still get a GL regression check.
+  - Plan ahead for the removal: Voxy's Iris shader-pack integration (`client/iris`, `client/mixin/iris`, ~1,480 lines) is GL-only today.
+- **The block-atlas readback becomes asynchronous** (step 2.3, approved). After a world load or resource reload, LODs may appear a frame or two later.
 
 ---
 
@@ -206,14 +218,14 @@ For comparison, the GL path: 44 files import `org.lwjgl.opengl` (~9,100 lines, ~
 
 ### 4.2 GL/VK duplicate pairs
 
-Lines per class. ★ marks pairs that a Blaze3D implementation could collapse into one class serving both MC backends.
+Lines per class. With GL in maintenance mode, the GL column is frozen. ★ marks VK classes that a Blaze3D implementation can replace. That implementation could later serve GL too, but only as a drop-in.
 
-| GL class | VK twin | Collapsible via Blaze3D? |
+| GL class (frozen) | VK twin | VK twin replaceable via Blaze3D? |
 |---|---|---|
 | `BoundRenderer` 143 | `VkBoundRenderer` 165 | ★ step 4.1 |
 | `NormalRenderPipeline` (setup + blit) 168 | `VkCompositor` 313 | ★ composite part, step 4.2 (setup only after 5.1) |
-| `GlAtlasTextureReader` 35 | `VkAtlasTextureReader` 72 | ★ step 2.3 |
-| `GPUTiming` 209 | *(none)* | ★ step 2.1 (VK gains timings) |
+| `GlAtlasTextureReader` 35 | `VkAtlasTextureReader` 72 | ★ step 2.3 (the GL reader stays, behind the new async interface) |
+| `GPUTiming` 209 | *(none)* | ★ step 2.1 adds Blaze3D timing for VK; GL keeps `GPUTiming` |
 | `ModelStore` 102 | `VkModelStore` 134 | ★ texture half only, step 3.1 |
 | `SSAO` 175 | `VkSSAO` 189 | only if SSAO becomes a fragment pass (5.2) |
 | `HiZBuffer2` 148 | `VkHiZ` 193 | ❌ |
@@ -231,8 +243,10 @@ Lines per class. ★ marks pairs that a Blaze3D implementation could collapse in
 
 ## 5. Roadmap — actionable steps
 
-Every step should land on its own (build, test, commit). Verify each step on both backends:
-- **GL** (Graphics API = Default).
+Every step targets the VK path. Per the [Decisions](#decisions-2026-09-25), GL only gets the minimal seam adapters a step calls out explicitly, and no rewrites.
+
+Every step should land on its own (build, test, commit). Verify each step on:
+- **GL** (Graphics API = Default): a regression check only, to make sure shared-code changes didn't break it.
 - **VK** (Graphics API = *Prefer Vulkan*). For validation, add MC's launch flags `--vulkanValidation --renderDebugLabels`; the Khronos validation layer must be installed.
 - **Production jar** in the Modrinth App on the M2 Max (MoltenVK: no `drawIndirectCount`, D32S8). `runClient` isn't enough.
 - A desktop GPU, for the `drawIndirectCount` path.
@@ -298,27 +312,48 @@ Every step should land on its own (build, test, commit). Verify each step on bot
 - The HiZ nearest-mip sampler can't be expressed (§2.1) and stays raw.
 - Low value: do it only if touching those files anyway.
 
-### Phase 2 — Backend-neutral utilities on the public API (benefit GL and VK)
+### Phase 2 — Small pieces onto the public Blaze3D API (VK first)
 
-**2.1 GPU timing on Blaze3D queries.** Re-implement `core/util/GPUTiming.java` with `GpuDevice.createTimestampQueryPool`, `CommandEncoder.writeTimestamp` and `DeviceInfo.timestampPeriod()`. The VK path gets frame timings it has never had, and GL query code goes away. On VK, timestamps are recorded into MC's buffer, so place them between segments (1.1).
+**2.1 GPU timing on Blaze3D queries (VK).** Build a VK timing path on `GpuDevice.createTimestampQueryPool`, `CommandEncoder.writeTimestamp` and `DeviceInfo.timestampPeriod()`. The VK path gets frame timings it has never had. GL keeps `core/util/GPUTiming.java` as it is (maintenance mode). On VK, timestamps are recorded into MC's buffer, so place them between segments (1.1).
 
-**2.2 Vendor/limits from `DeviceInfo`.** In shared code that only needs vendor or limits, prefer `DeviceInfo.vendorName()/name()/type()/limits()` over `Capabilities.isNvidia/isAmd/isIntel`. Keep GL-only probes, such as the broken-depth-sampler and memory queries, GL-only.
+**2.2 Vendor/limits from `DeviceInfo` (only where VK needs it).** Where the VK path needs vendor or limits, use `DeviceInfo.vendorName()/name()/type()/limits()` instead of the GL-only `Capabilities`. Leave GL's `Capabilities` probes untouched.
 
-**2.3 Atlas readback via Blaze3D (VK first)**
+**2.3 Asynchronous atlas readback via Blaze3D — approved (Decisions)**
+- *What it's for:* the model bakery's software rasterizer samples MC's block atlas (`minecraft:textures/atlas/blocks.png`, RGBA8) from a CPU copy, via `SoftwareModelTextureBakery.setupTexture()` → `IAtlasTextureReader`. The copy is taken once per renderer creation (world join, resource reload).
+- *Today it's synchronous on both backends:*
+  - GL: `glFinish()` + `glGetTextureImage`.
+  - VK: `VkAtlasTextureReader` records a copy into Voxy's own command buffer, `vkQueueSubmit`s it straight onto MC's queue, and blocks on a fence.
+  - That VK submit jumps ahead of MC's unsubmitted work. A mid-frame renderer creation after a resource reload would therefore read a stale atlas, which is why VK renderer creation is deferred to the next frame (`MixinMinecraftFrameStart` + `voxy$pendingCreate` in `MixinLevelRenderer`).
 - *How:*
-  - `buf = device.createBuffer(label, MAP_READ|COPY_DST, w*h*4)`, then `encoder.copyTextureToBuffer(atlas, buf, 0, callback, 0)`, then map and read in the callback.
-  - The callback is **asynchronous on both backends**: on VK it runs after 2 submits via `queueForDestroy`; on GL, via `RenderSystem.queueFencedTask`.
-  - `ModelBakerySubsystem` therefore has to accept the atlas arriving 1–3 frames after construction.
-- *Payoff:* it removes the last reason for Voxy's synchronous `vkQueueSubmit` on MC's queue (D6) apart from init fills, which 1.1 segments can absorb.
-- *Caution:* upstream's `GlAtlasTextureReader` (`core/model/bakery/GlAtlasTextureReader.java:21`) deliberately avoids Blaze3D (*"doing it with b3d has some issues"*). Ship the VK side first and only replace the GL side after reproducing and understanding that issue.
+  1. Make `IAtlasTextureReader` asynchronous: `void readAsync(GpuTexture atlas, int w, int h, Consumer<int[]> onReady)`.
+  2. **VK implementation, public Blaze3D API only:** `buf = RenderSystem.getDevice().createBuffer(() -> "voxy atlas readback", GpuBuffer.USAGE_MAP_READ | GpuBuffer.USAGE_COPY_DST, (long) w * h * 4)`, then `createCommandEncoder().copyTextureToBuffer(atlas, buf, 0, callback, 0)`. The atlas has `COPY_SRC`: `TextureAtlas.createTexture` uses usage 15. The copy lands in MC's own command stream, after MC's atlas upload.
+  3. The callback runs on the render thread inside MC's `submit()` about one frame later, after the GPU has finished the copy. In it:
+     - Read the ints in native byte order, as the current reader does with `MemoryUtil.memIntBuffer`: `try (var v = buf.map(true, false)) { v.data().order(ByteOrder.nativeOrder()).asIntBuffer().get(pixels); }`.
+     - Then `buf.close()`. The mapping must be closed first, because Blaze3D throws when closing a mapped buffer.
+     - Publish `pixels` to the rasterizer through a volatile field, then unpark the "Model factory processor" thread.
+  4. Gate baking on the atlas: `ModelFactory.processAllThings()` returns early until the atlas is set. Bake requests just queue up meanwhile, and `RenderGenerationService` already retries sections whose models aren't baked yet (`IdNotYetComputedException`). LODs simply start appearing a frame or two later.
+  5. **GL (maintenance mode):** keep `GlAtlasTextureReader` as it is. Its `readAsync` calls the existing synchronous read and invokes the callback immediately, so GL behaviour doesn't change. Upstream deliberately avoids Blaze3D there (`GlAtlasTextureReader.java:21`: *"doing it with b3d has some issues"*), which is one more reason to leave it alone.
+- *Edge cases:*
+  - The renderer can shut down before the callback fires (a quick world leave or reload). Check a closed flag and just free the buffer.
+  - At game exit, MC's `commandEncoder.destroy()` still runs pending callbacks, so the callback must not touch freed Voxy objects.
+  - The buffer is `w×h×4` bytes, which HD packs can push to tens of MB (a 4096×4096 atlas is 64 MB). It only lives for about a frame.
+- *Payoff:*
+  - No GPU stall on world join or reload.
+  - Deletes `VkAtlasTextureReader`'s raw copy and its `VulkanGpuTexture` cast (Tier B).
+  - Removes the atlas's direct `vkQueueSubmit` on MC's queue (D6).
+- *Follow-up (verify, then do):* deferred VK renderer creation exists only because the synchronous readback could read a stale atlas. If nothing else in `VkRenderCore` construction reads MC-owned GPU state, `MixinMinecraftFrameStart` and the pending-create path in `MixinLevelRenderer` can go.
+- *Done when:*
+  - After a world join and a resource-pack reload, LOD block textures are correct on VK and MoltenVK.
+  - The atlas no longer goes through `VkFrameCtx.flushImmediate()`.
+  - GL behaves exactly as before.
 
 ### Phase 3 — Create textures through Blaze3D, keep binding them raw
 
 **3.1 Model atlas as a `GpuTexture`**
 - *How:*
   - `createTexture(USAGE_TEXTURE_BINDING|USAGE_COPY_DST, RGBA8_UNORM, w, h, 1, LAYERS)`, then `CommandEncoder.writeToTexture(tex, buf, mip, 0, x, y, w, h)` per mip.
-  - Bind raw with `host.vkImageView(view)` in layout `GENERAL` (D1) on VK, and `glId()` on GL.
-  - Delete the upload/transition half of `VkModelStore` and the GL `ModelStore` texture code.
+  - Bind raw with `host.vkImageView(view)` in layout `GENERAL` (D1).
+  - Delete the upload/transition half of `VkModelStore`. The GL `ModelStore` stays as it is.
   - Uploads go through MC's per-submit `TransientMemory`, so check peak per-frame upload size during heavy baking.
 - *Gotcha:* the texture's init barrier is recorded into MC's current buffer at creation, so create it outside a Voxy segment (1.1).
 
@@ -332,7 +367,7 @@ Every step should land on its own (build, test, commit). Verify each step on bot
 
 ### Phase 4 — Blaze3D render passes
 
-**4.1 Pilot: chunk-bounds renderer as one Blaze3D pass for both backends**
+**4.1 Pilot: chunk-bounds renderer as a Blaze3D pass**
 - *Shader:*
   - Port `chunkoutline/outline.vsh/.fsh` to MC's dialect: `#version 330`, a named std140 block, and a **per-instance vertex attribute** for the chunk position instead of the `ChunkPosBuffer` SSBO.
   - Ship it as `assets/voxy/shaders/core/<name>.vsh/.fsh`. MC's `ShaderManager` lists `shaders/` in every namespace, so the default `ShaderSource` finds it as `voxy:core/<name>`. Don't depend on `precompilePipeline(pipeline, customSource)`: `ShaderManager` calls `clearPipelineCache()` on resource reload, and the pipeline then recompiles from the default source.
@@ -344,7 +379,7 @@ Every step should land on its own (build, test, commit). Verify each step on bot
   - `RenderPassDescriptor.withUnusedColorAttachment().withDepthAttachment(depthBoundView, inverseClearDepth)`.
   - The index buffer is a `GpuBuffer(USAGE_INDEX)` of the 36 cube indices.
   - The `StreamedBoundStore` storage becomes `GpuBuffer(USAGE_VERTEX|USAGE_COPY_DST)` filled via `writeToBuffer`/`TransientMemory`.
-- *Done when:* `BoundRenderer` and `VkBoundRenderer` are replaced by one class, and LOD fragments behind vanilla terrain are still discarded on GL, VK and MoltenVK.
+- *Done when:* `VkBoundRenderer` is replaced by the Blaze3D class, and LOD fragments behind vanilla terrain are still discarded on VK and MoltenVK. GL's `BoundRenderer` stays. Switching GL to the new class is optional, and only if it's a drop-in.
 - *Why first:* it's small (about 150 lines), self-contained, depth-only, and proves the whole toolchain: MC-dialect shaders, custom `ShaderSource`, Blaze3D textures bound raw elsewhere, and segment splicing.
 
 **4.2 Composite pass into MC's framebuffer via Blaze3D**
@@ -355,7 +390,7 @@ Every step should land on its own (build, test, commit). Verify each step on bot
   - Samplers `depthTex`, `colourTex`; UBO `CompositeParams`; colour target format taken from MC's colour view.
   - The render pass targets `RenderTarget.getColorTextureView()/getDepthTextureView()`.
 - *Prerequisites:* the sampled colour must be a Blaze3D texture (needs 5.2) and the sampled depth must be one too (needs 5.1, or a D32 depth copy).
-- *Payoff:* the one pass that writes MC's framebuffer follows MC's layouts, barriers and formats automatically, including a future HDR main target. It also deletes `VkFrameHost.mcImageBarrier` and the GL blit.
+- *Payoff:* the one pass that writes MC's framebuffer follows MC's layouts, barriers and formats automatically, including a future HDR main target. It also deletes `VkFrameHost.mcImageBarrier`. The GL blit stays.
 
 ### Phase 5 — Research and decisions that unlock more
 
@@ -368,13 +403,16 @@ Every step should land on its own (build, test, commit). Verify each step on bot
   - (c) Translucent LODs.
 - *If viable:* Voxy depth becomes `D32_FLOAT` (Blaze3D-creatable), the setup pass becomes Blaze3D-expressible (its push constant becomes a UBO), and 4.2's depth input is unblocked.
 
-**5.2 SSAO as a fullscreen fragment pass.** Drops the storage-image requirement on `colourSSAO` (needed for 3.2 and 4.2) and makes `SSAO`/`VkSSAO` collapsible. Needs a performance comparison against compute on desktop and on the M2 Max.
+**5.2 SSAO as a fullscreen fragment pass (VK).** Drops the storage-image requirement on `colourSSAO` (needed for 3.2 and 4.2) and lets `VkSSAO` become a Blaze3D pass. GL's `SSAO` stays. Needs a performance comparison against compute on desktop and on the M2 Max.
 
-**5.3 Long-term fate of the GL backend (your call).** MC 26.2 defaults to OpenGL, so GL stays essential for now. Every Phase 4 pass removes one GL/VK pair, but the compute core needs two implementations for as long as GL is supported. Revisit when Mojang makes Vulkan the default.
+**5.3 Long-term fate of the GL backend — decided: maintenance mode until MC drops OpenGL** (see [Decisions](#decisions-2026-09-25)). When GL is finally removed:
+- Delete `client/core/gl`, the GL column of [§4.2](#42-glvk-duplicate-pairs), `Capabilities`, and the GL-only mixins (the GL branch of `MixinDefaultChunkRenderer`, `MixinGlDebug`, nvidium).
+- The backend-neutral seams (`IDeviceBuffer`, `IRenderList`, `Abstract{Upload,Download}Stream`, …) exist only for GL/VK parity. Once GL is gone they can collapse into their VK implementations.
+- Decide what happens to the GL-only Iris integration before then.
 
 ### Options considered but not recommended yet
 
-- **O1 — Storage usage through Blaze3D.** Two tiny mixins on `VulkanConst.bufferUsageToVk` / `textureUsageToVk` could map a Voxy-only usage bit to `STORAGE_BUFFER`/`STORAGE_IMAGE`. That would let *all* Voxy resources be created via `GpuDevice` (VMA, labels, deferred destroy) on both backends, while still being bound raw. It adds new Tier C coupling, so only reach for it if 1.4 + 3.x still leave too much custom resource code.
+- **O1 — Storage usage through Blaze3D.** Two tiny mixins on `VulkanConst.bufferUsageToVk` / `textureUsageToVk` could map a Voxy-only usage bit to `STORAGE_BUFFER`/`STORAGE_IMAGE`. That would let *all* of the VK path's resources be created via `GpuDevice` (VMA, labels, deferred destroy), while still being bound raw. It adds new Tier C coupling, so only reach for it if 1.4 + 3.x still leave too much custom resource code.
 - **Texel buffers instead of SSBOs in raster shaders.** The terrain geometry buffer (up to 2 GB) exceeds `maxTexelBufferElements` on many devices, so this doesn't work for terrain. It *does* work for small inputs like chunk positions (alternative to the instanced attribute in 4.1).
 - **Hooking MC's frame graph instead of Sodium.** Sodium cancels vanilla `renderGroup` at HEAD (D11), so Voxy has to run after Sodium's opaque draw. The Sodium hook stays.
 
@@ -430,7 +468,7 @@ grep -n "pushConstant\|PushConstant" -r $B/pipeline $B/systems
 5. **Public API churn.** Diff `CommandEncoder`, `RenderPass`, `RenderPipeline`, `GpuDevice`, `GpuBuffer`/`GpuTexture` usage constants, `BindGroupLayout` and `DeviceInfo` against the previous version.
 6. Run the watchlist in §6 and update §4/§5 if anything unlocked.
 7. **Test:**
-   - GL (Default) and VK (Prefer Vulkan) with `--vulkanValidation`.
+   - VK (Prefer Vulkan) with `--vulkanValidation`, plus a GL (Default) regression check.
    - The built jar in the Modrinth App on the M2 Max (MoltenVK).
    - A desktop GPU with `drawIndirectCount`.
    - World join/leave twice and a resource-pack reload (renderer re-creation and atlas readback).
@@ -439,10 +477,10 @@ grep -n "pushConstant\|PushConstant" -r $B/pipeline $B/systems
 
 ## 8. Open questions for you
 
-1. **Should the GL backend ever go?** (5.3) Phase 4 is worth more if GL stays, since each pass is written once for both backends. If GL is going away, VK-only cleanups become just as good.
-2. **Is an async atlas readback acceptable?** (2.3) LODs would appear 1–3 frames later after world load or a resource reload.
-3. **Is a temporary visual difference at the vanilla/LOD seam acceptable** while evaluating stencil-free masking (5.1)?
-4. **Tolerance for new internal mixins:** is O1 acceptable if it deletes a lot of custom resource code, or is "fewest Blaze3D-internal hooks" the priority?
+Two questions are already settled (see [Decisions](#decisions-2026-09-25)): GL is in maintenance mode, and the atlas readback goes async.
+
+1. **Is a temporary visual difference at the vanilla/LOD seam acceptable** while evaluating stencil-free masking (5.1)?
+2. **Tolerance for new internal mixins:** is O1 acceptable if it deletes a lot of custom resource code, or is "fewest Blaze3D-internal hooks" the priority?
 
 ---
 
