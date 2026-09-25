@@ -50,11 +50,15 @@ Work happens on the branch `blaze3d-migration`, off `vulkan-audit-fixes`. Sectio
 | 0.1 Blaze3D-VK classes only in `MinecraftVkHostAdapter` + `mixin/vk` | Done | `6fc22f19` |
 | 0.2 Contracts D1–D11 on `IVkHost`; D5 checked at device creation | Done | `b81829ec` |
 | 1.1 Frame spliced in with `execute()`; `AccessorVulkanCommandEncoder` deleted | Done, tested in-game (see below) | `16678071` |
-| 1.2 Frame retirement through `GpuFence` | Done, needs in-game testing | `dded36b2` |
-| 1.3 MC's destruction queue for deferred destroys (immediate during teardown) | Done, needs in-game testing | `7a56ff41` |
-| 1.4 Allocations through MC's VMA | Done, needs in-game testing | `e14ef866` |
-| 1.5 (optional) Samplers from Blaze3D | Not started | |
-| Phase 2 remainder (2.1 GPU timing, 2.2 `DeviceInfo`) | Not started | |
+| 1.2 Frame retirement through `GpuFence` | Done, fine in normal play (see below) | `dded36b2` |
+| 1.3 MC's destruction queue for deferred destroys (immediate during teardown) | Done, fine in normal play | `7a56ff41` |
+| 1.4 Allocations through MC's VMA | Done, fine in normal play | `e14ef866` |
+| Fix: LOD sections blanking while turning or leaving a spyglass (not a plan step) | Done, tested in-game (see below) | `110a6555`, `e0c6544d`, `719c29c1` |
+| 2.1 GPU timing on Blaze3D queries | Done, needs in-game testing | `6dac2b9b` |
+| 2.2 Name and limits from `DeviceInfo` | Done, needs in-game testing | `c09df914` |
+| 2.3 follow-up: drop deferred VK renderer creation | Decided: keep it (see [2.3](#phase-2--small-pieces-onto-the-public-blaze3d-api-vk-first)) | |
+| 1.5 (optional) Samplers from Blaze3D | Not started; do it together with 3.1, which touches the atlas sampler anyway | |
+| Phase 3 onwards | Not started | |
 
 In-game checks for the finished steps:
 - VK (Prefer Vulkan), with `--vulkanValidation` if the validation layer is installed.
@@ -68,10 +72,38 @@ Tested 2026-09-25 (jar `1667807`, M2 Max, Vulkan/MoltenVK, a server with a large
 - The renderer was built, rebuilt when the server set the view distance (pre-existing behaviour), and shut down cleanly.
 - Not reported yet: the F3+T reload and the GL regression check.
 
+Tested 2026-09-25 (jars `e14ef86` and `719c29c`, same setup):
+- 1.2–1.4: normal play works, including joining the server.
+- The LOD blanking is gone: holes while panning on a mountain, and a blank second after leaving a spyglass. It is gone with and without `-Dvoxy.vk.disableSubgroupHiZ=true`, so the subgroup HiZ was not a cause; the switch stays as a diagnostic.
+  - Causes: the flat 2 GB geometry buffer stayed full, so the cleaner evicted whatever had just left the screen (`719c29c1` sizes it like GL, about 4 GiB on the M2 Max); and MoltenVK's draw budget, sized from a count read back 2–3 frames late, cut off draws when the visible count jumped (`e0c6544d` holds the largest count of the last 8 s).
+- FPS is somewhat lower than before, as expected: more geometry stays resident and gets drawn. See [Performance watch](#performance-watch).
+- Still not reported: the F3+T reload and the GL regression check.
+
+What to watch for with 2.1 and 2.2:
+- **2.1:** set F3's `voxy:gpu_debug` entry to "In F3" (F3+F6 opens the debug options). About a second later F3 shows `GpuTime: [setup:…, bounds:…, RO:…, hiz:…, I:…, prep:…, OT:…, CG:…, TS:…, TP:…, ao:…, RT:…, comp:…, dyn:…] = total ms, worst …`. LODs must look the same with the line on and off, because the line splits Voxy's frame into one command buffer per section. If the log shows *"GPU timing marker inside a rendering instance"*, a marker sits inside a pass. On MoltenVK the times are approximate: Metal samples timestamps at encoder boundaries.
+- **2.2:** the log line *"Voxy Vulkan context adopted Minecraft device: … (vendor=…, type=…, driver=…"* names the vendor, device type and driver; everything else behaves as before.
+
 What to watch for with 1.2–1.4:
 - **1.2:** frame retirement drives readbacks and staging reuse. If it breaks, LODs stop loading or refining, and the log shows *"VK upload stream full"* or *"VK download stream full"* with hitches.
 - **1.3:** GPU objects are now destroyed by MC's queue. Test world leave/rejoin, a resource-pack reload, resizing the window (recreates Voxy's targets) and changing Voxy's render distance. Watch for a device-lost crash, or *"VkFrameCtx used after teardown began"* in the log.
 - **1.4:** memory now comes from MC's allocator. The log should still say *"Allocating 2048MB VK geometry buffer"* with no *"VK geometry allocation failed, retrying"* line, and GPU memory use should look the same.
+
+### Performance watch
+
+Performance is a co-priority of the migration: a step that makes the VK path slower needs a reason.
+- **Measure:**
+  - F3 `GpuTime` (2.1, with `voxy:gpu_debug`) gives the GPU time per pass.
+  - F3 `VK draws/budget (10s shortfalls)` (MoltenVK only) gives each terrain pass's real draw count, the budget it was drawn with, and how often the budget fell short.
+- **Known costs on MoltenVK (the M2 Max):**
+  - MoltenVK has no indirect-count draws, so every budget slot is one Metal draw, empty ones included, encoded on the render thread inside MC's submit. The budget is the largest count of the last 8 s × 1.5 plus headroom (1024 opaque, 256 temporal/translucent). The × 1.5 predates the 8 s hold (`e0c6544d`) and could come down if `short` stays at 0.
+  - Since `719c29c1` the geometry buffer is about 4 GiB instead of 2 GB, so more detail stays resident and is drawn. That costs frames, but it is what GL does too.
+- **Rules for the remaining steps:**
+  - Every Blaze3D encoder operation ends with a full barrier (D2). Don't route per-item work through Blaze3D calls without batching it: for example 3.1's model-atlas uploads, which would be one `writeToTexture` per region. Compare `GpuTime` before and after.
+  - A Blaze3D call inside Voxy's frame needs a segment split (1.1, gotcha a). Splits are cheap, but keep them at pass boundaries.
+  - Phase 4 swaps raw passes for Blaze3D ones: compare `bounds` (4.1) and `comp` (4.2) before and after.
+- **Bigger levers, outside the migration (need a decision):**
+  - Fewer, larger terrain draws on MoltenVK: today every visible section is one Metal draw.
+  - A smaller growth factor in the draw budget.
 
 ---
 
@@ -355,9 +387,19 @@ Every step should land on its own (build, test, commit). Verify each step on:
 
 ### Phase 2 — Small pieces onto the public Blaze3D API (VK first)
 
-**2.1 GPU timing on Blaze3D queries (VK).** Build a VK timing path on `GpuDevice.createTimestampQueryPool`, `CommandEncoder.writeTimestamp` and `DeviceInfo.timestampPeriod()`. The VK path gets frame timings it has never had. GL keeps `core/util/GPUTiming.java` as it is (maintenance mode). On VK, timestamps are recorded into MC's buffer, so place them between segments (1.1).
+**2.1 GPU timing on Blaze3D queries (VK) — ✅ done (`6dac2b9b`)**
+- *As built:*
+  - `VkGpuTiming` uses only the public API: `createTimestampQueryPool`, `CommandEncoder.writeTimestamp`, `GpuQueryPool.getValues` and `DeviceInfo.timestampPeriod()`.
+  - `VkFrameCtx.gpuMarker(label)` splits the frame there: it splices the segment recorded so far with `execute()`, the timestamp lands in MC's next buffer, and a new segment begins. A marker right after a segment began needs no split, because the empty segment follows MC's current buffer anyway.
+  - Timing runs only while F3's `voxy:gpu_debug` entry is showing (`DebugEntries.isGpuDebugShown()`, "In F3" and F3 open, or "Always"). Otherwise nothing is split or written.
+  - Results are read when the frame retires (a `GpuFence` retire listener). MC's `writeTimestamp` resets the query on the host, so a frame's queries are reused only after that; 4 slots of 32 queries.
+  - The F3 line uses GL's labels where the pass is the same (`RO`, `I`, `OT`, `CG`, `TS`, `TP`, `ao`, `RT`; VK splits GL's `I` into `hiz` + `I`). It averages over one second, with the average and worst frame total. GL shows a decaying peak instead.
+  - GL keeps `core/util/GPUTiming.java` as it is (maintenance mode).
+- *Original plan:* build a VK timing path on `GpuDevice.createTimestampQueryPool`, `CommandEncoder.writeTimestamp` and `DeviceInfo.timestampPeriod()`, with the timestamps placed between segments (1.1), because they are recorded into MC's buffer.
 
-**2.2 Vendor/limits from `DeviceInfo` (only where VK needs it).** Where the VK path needs vendor or limits, use `DeviceInfo.vendorName()/name()/type()/limits()` instead of the GL-only `Capabilities`. Leave GL's `Capabilities` probes untouched.
+**2.2 Vendor/limits from `DeviceInfo` (only where VK needs it) — ✅ done (`c09df914`)**
+- *As built:* the VK path never used the GL-only `Capabilities`. `VulkanContext` now takes the device name, `maxMemoryAllocationSize` and the uniform-buffer alignment from `DeviceInfo`, and logs `vendorName()`, `type()` and `driverInfo()`. `DeviceInfo` has no subgroup properties, storage-buffer range or alignment, depth-stencil formats or memory heaps, so those are still queried from Vulkan.
+- *Original plan:* where the VK path needs vendor or limits, use `DeviceInfo.vendorName()/name()/type()/limits()` instead of `Capabilities`. Leave GL's `Capabilities` probes untouched.
 
 **2.3 Asynchronous atlas readback via Blaze3D — ✅ done (`1ce62302`); the follow-up below is still open**
 - *As built:* `IAtlasTextureReader.readAsync` and `Blaze3DAtlasTextureReader`. `ModelBakerySubsystem` starts the readback before its processing thread starts, and `ModelFactory.processAllThings()` waits for `SoftwareModelTextureBakery.isTextureReady()`. Deferred renderer creation stays for now: it also guarantees no MC render pass is open when the copy is recorded.
@@ -383,7 +425,10 @@ Every step should land on its own (build, test, commit). Verify each step on:
   - No GPU stall on world join or reload.
   - Deletes `VkAtlasTextureReader`'s raw copy and its `VulkanGpuTexture` cast (Tier B).
   - Removes the atlas's direct `vkQueueSubmit` on MC's queue (D6).
-- *Follow-up (verify, then do):* deferred VK renderer creation exists only because the synchronous readback could read a stale atlas. If nothing else in `VkRenderCore` construction reads MC-owned GPU state, `MixinMinecraftFrameStart` and the pending-create path in `MixinLevelRenderer` can go.
+- *Follow-up — decided 2026-09-25: keep deferred creation.* It was introduced because the synchronous readback could read a stale atlas, but it still does two jobs:
+  - `CommandEncoder.copyTextureToBuffer` throws inside an open render pass, and a world join or reload can start renderer creation mid-frame. `Minecraft.renderFrame` HEAD is a point with no pass open.
+  - Construction ends with `VkFrameCtx.flushImmediate()`, a direct submit on MC's queue. At the frame boundary it cannot jump ahead of MC's unsubmitted work.
+  - The cost is LODs starting one frame later.
 - *Done when:*
   - After a world join and a resource-pack reload, LOD block textures are correct on VK and MoltenVK.
   - The atlas no longer goes through `VkFrameCtx.flushImmediate()`.
@@ -533,9 +578,10 @@ Two questions are already settled (see [Decisions](#decisions-2026-09-25)): GL i
 | `core/vk/MinecraftVkHost.java` | 38 | `RenderSystem.tryGetDevice` (A) | detects MC-on-Vulkan | — |
 | `core/vk/MinecraftVkHostAdapter.java` | 53 | `VulkanDevice`, `VulkanCommandEncoder` (B, C) | handles, frame cmd, semaphore signal | 0.1 ✅, 1.1 ✅, 1.2 (now also holds the feature request and handle lookups) |
 | `core/vk/VulkanBackend.java` | 71 | — | adoption lifecycle | — |
-| `core/vk/VulkanContext.java` | 238 | — | caps (subgroups, limits, formats), cmd pool, pipeline cache, samplers, set-layout cache, memory types | 1.4, 1.5 |
+| `core/vk/VulkanContext.java` | 238 | — | caps (subgroups, limits, formats), cmd pool, pipeline cache, samplers, set-layout cache, memory types | 1.4 ✅, 1.5, 2.2 ✅ (name and two limits now from `DeviceInfo`) |
 | `core/vk/VkDeviceFeatures.java` | 97 | `VulkanFeature`, `VulkanBackend` statics (B) | extra feature request/record | 0.1 |
-| `core/vk/VkFrameCtx.java` | 337 | via `IVkHost` | recording target, retirement, deferred destroy, barriers, immediate submit | 1.1–1.3 |
+| `core/vk/VkFrameCtx.java` | 337 | via `IVkHost` | recording target, retirement, deferred destroy, barriers, immediate submit | 1.1–1.3 ✅, 2.1 ✅ (segment splits for timing) |
+| `core/vk/VkGpuTiming.java` | new | timestamp queries (A) | F3 `GpuTime` for the VK path | 2.1 ✅ |
 | `core/vk/VkBuffer.java` | 141 | — | buffer + dedicated memory | 1.4 |
 | `core/vk/VkImage2D.java` | 179 | — | image + memory + views + layout tracking | 1.4, 3.x |
 | `core/vk/VkShaderPipeline.java` | 330 | — | compute+graphics pipelines, push descriptors/constants, stencil | stays (compute); 4.x replaces two graphics users |
