@@ -68,7 +68,7 @@ Voxy is a Level of Detail (LoD) rendering mod for Minecraft built on Fabric, des
 Key configuration in `gradle.properties`:
 - `minecraft_version` - Currently 26.2
 - `sodium_version_modrinth` - Sodium dependency version
-- `mod_version` - Current version (0.2.22+mc26.2)
+- `mod_version` - Current version (0.2.23+mc26.2, in development)
 - `includeOtherArchs` - Set to "true" to include ARM64 natives
 
 ## Architecture Overview
