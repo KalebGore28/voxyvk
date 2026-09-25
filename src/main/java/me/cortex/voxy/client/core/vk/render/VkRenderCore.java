@@ -336,9 +336,11 @@ public class VkRenderCore {
 
         if (deviceAlive) {
             try {
-                //Idle the device BEFORE destroying anything, so no destroy races
-                // GPU work still referencing these objects
-                this.frameCtx.waitIdleRetireAll();
+                //Idle the device BEFORE destroying anything, so no destroy races GPU work
+                // still referencing these objects. From here on frees destroy at once (see
+                // beginTeardown), so a renderer created right after never shares memory with
+                // this one's leftovers
+                this.frameCtx.beginTeardown();
                 //modelService.shutdown() joins the (CPU) baking thread and frees
                 // the VkModelStore exactly once. It OWNS the store's lifetime —
                 // VkRenderCore must not free modelStore itself (double

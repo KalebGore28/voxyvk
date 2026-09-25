@@ -13,6 +13,7 @@ and this project uses versioning in the format `MAJOR.MINOR.PATCH+mcVERSION`.
 - Vulkan: Minecraft's block atlas is now read back asynchronously through Blaze3D's public API. The copy is recorded into Minecraft's own command stream instead of a separate queue submission that stalled until the GPU finished, and the model bakery starts baking once the pixels arrive, about a frame later. After joining a world or reloading resources, LODs can appear a frame or two later. OpenGL still reads the atlas synchronously, as before
 - Vulkan: Voxy's frame is recorded into its own command buffer and spliced into Minecraft's frame through the encoder's public methods, instead of reading the encoder's private command buffer. It no longer skips a frame when Minecraft has no command buffer open at the hook
 - Vulkan: Voxy tracks when its frames have finished on the GPU with Minecraft's public GPU fences instead of its own timeline semaphore
+- Vulkan: GPU objects that frames in flight may still use are handed to Minecraft's destruction queue instead of a list Voxy kept itself. A renderer shut down while one of its frames was still unsubmitted no longer leaks them, and shutdown still frees everything at once, so a renderer rebuilt right away (e.g. when a server changes the view distance on join) never holds two geometry buffers
 
 ## [0.2.21+mc26.2] - 2026-09-25
 

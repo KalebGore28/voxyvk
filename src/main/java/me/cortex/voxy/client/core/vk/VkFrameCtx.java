@@ -36,9 +36,9 @@ import static org.lwjgl.vulkan.VK10.*;
 //    Blaze3D API) on the MC submission it was spliced into. The fence can only
 //    complete once MC has submitted the frame AND the GPU has executed it, and
 //    submissions complete in order, so frames retire oldest first as their fences
-//    complete. Upload / download streams and deferred destruction retire on it;
+//    complete. Upload / download streams retire on it;
 //  - deferred destruction of buffers/images/pipelines still referenced by frames
-//    in flight;
+//    in flight, through MC's destruction queue (at once during teardown);
 //  - two invariants MC's command stream relies on: MC ends every operation with a
 //    full memory barrier and never emits one before a pass, so Voxy's frame ends
 //    the same way; and a rendering instance left open by an exception is closed
@@ -59,18 +59,16 @@ public final class VkFrameCtx {
     private VkCommandBuffer immediateCmd;  //one-shot fallback outside the hook
     private boolean anyWorkThisFrame;
     private boolean renderingActive;       //a vkCmdBeginRenderingKHR without its end has been recorded
+    private boolean destroyImmediately;    //set by beginTeardown once nothing is in flight
 
     //Frame indices start at 1 so 0 means "nothing completed"
     private long frameCounter = 1;         //index of the frame currently being recorded
     private long retiredCounter = 0;       //all frames <= this have completed on the GPU
     private final ArrayDeque<FrameFence> inFlight = new ArrayDeque<>();//oldest first
 
-    private final ArrayList<PendingDestroy> pendingDestroys = new ArrayList<>();
     private final ArrayList<FrameRetireListener> retireListeners = new ArrayList<>();
 
     private record FrameFence(long frameIdx, GpuFence fence) {}
-    private record PendingDestroy(long frameIdx, long buffer, long image, long imageView, long memory,
-                                  long pipeline, long pipelineLayout) {}
 
     public VkFrameCtx(VulkanContext ctx, IVkHost host) {
         this.ctx = ctx;
@@ -139,6 +137,10 @@ public final class VkFrameCtx {
     public VkCommandBuffer cmd() {
         if (Thread.currentThread() != this.ownerThread) {
             throw new IllegalStateException("VkFrameCtx used off the render thread (" + Thread.currentThread().getName() + ")");
+        }
+        if (this.destroyImmediately) {
+            //Objects freed during teardown are already destroyed; work recorded now could use them
+            throw new IllegalStateException("VkFrameCtx used after teardown began");
         }
         this.anyWorkThisFrame = true;
         if (this.frameCmd != null) return this.frameCmd;
@@ -241,33 +243,30 @@ public final class VkFrameCtx {
         for (var l : this.retireListeners) {
             l.onFramesRetired(this.retiredCounter);
         }
-        this.pendingDestroys.removeIf(d -> {
-            if (d.frameIdx <= this.retiredCounter) {
-                if (d.pipeline != VK_NULL_HANDLE) vkDestroyPipeline(this.ctx.device, d.pipeline, null);
-                if (d.pipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(this.ctx.device, d.pipelineLayout, null);
-                if (d.buffer != VK_NULL_HANDLE) vkDestroyBuffer(this.ctx.device, d.buffer, null);
-                if (d.imageView != VK_NULL_HANDLE) vkDestroyImageView(this.ctx.device, d.imageView, null);
-                if (d.image != VK_NULL_HANDLE) vkDestroyImage(this.ctx.device, d.image, null);
-                if (d.memory != VK_NULL_HANDLE) vkFreeMemory(this.ctx.device, d.memory, null);
-                return true;
-            }
-            return false;
-        });
     }
 
     //==================================================================================
     // Deferred destruction (objects may still be referenced by frames in flight)
 
-    public void deferDestroy(long buffer, long memory) {
-        this.pendingDestroys.add(new PendingDestroy(this.frameCounter, buffer, VK_NULL_HANDLE, VK_NULL_HANDLE, memory, VK_NULL_HANDLE, VK_NULL_HANDLE));
+    //Destroys an object once no frame recorded so far can still use it: through MC's
+    // destruction queue, which runs it after the submission being recorded now has
+    // completed; at once after beginTeardown() found nothing in flight.
+    public void deferDestroy(Runnable destroy) {
+        if (this.destroyImmediately) {
+            destroy.run();
+        } else {
+            this.host.deferDestroy(destroy);
+        }
     }
 
-    public void deferDestroyImage(long image, long view, long memory) {
-        this.pendingDestroys.add(new PendingDestroy(this.frameCounter, VK_NULL_HANDLE, image, view, memory, VK_NULL_HANDLE, VK_NULL_HANDLE));
-    }
-
-    public void deferDestroyPipeline(long pipeline, long pipelineLayout) {
-        this.pendingDestroys.add(new PendingDestroy(this.frameCounter, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, pipeline, pipelineLayout));
+    //Shutdown: waits for the GPU and, when every frame Voxy recorded has completed (none
+    // still sits in MC's unsubmitted submission), destroys everything freed from here on at
+    // once rather than a frame later. A renderer rebuilt right away (e.g. on a view-distance
+    // change) then never holds two geometry buffers at the same time. Nothing may be
+    // recorded afterwards (cmd() refuses).
+    public void beginTeardown() {
+        this.waitIdleRetireAll();
+        this.destroyImmediately = this.frameCmd == null && this.inFlight.isEmpty();
     }
 
     //==================================================================================
@@ -315,20 +314,13 @@ public final class VkFrameCtx {
     }
 
     public void free() {
-        this.waitIdleRetireAll();
-        if (this.frameCmd == null && this.inFlight.isEmpty()) {
-            //Everything Voxy recorded has executed and nothing is being recorded, so
-            // objects freed since the last frame (tagged with the upcoming index) are
-            // unused too: retire everything
-            this.retiredCounter = Long.MAX_VALUE;
-            this.runRetirement();
-        } else {
-            //A frame MC has not submitted yet still references Voxy's objects: leaking
-            // them is the only safe option
-            Logger.error("VkFrameCtx freed while a recorded frame is unsubmitted; leaking "
-                    + this.pendingDestroys.size() + " pending destroys");
-            this.inFlight.forEach(frame -> frame.fence.close());
-            this.inFlight.clear();
+        this.beginTeardown();
+        if (!this.destroyImmediately) {
+            //A frame MC has not submitted yet still uses Voxy's objects; they stay in MC's
+            // destruction queue, which destroys them once that frame has completed
+            Logger.info("VkFrameCtx freed while a recorded frame is unsubmitted; Minecraft destroys its objects once it completes");
         }
+        this.inFlight.forEach(frame -> frame.fence.close());
+        this.inFlight.clear();
     }
 }

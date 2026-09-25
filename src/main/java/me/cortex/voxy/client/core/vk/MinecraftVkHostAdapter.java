@@ -84,6 +84,11 @@ public final class MinecraftVkHostAdapter implements IVkHost {
         this.device.createCommandEncoder().execute(segment);
     }
 
+    @Override
+    public void deferDestroy(Runnable destroy) {
+        this.device.createCommandEncoder().queueForDestroy(destroy::run);
+    }
+
     //Run by MixinVulkanBackend on MC's device extensions and (mutable) enabled-feature set
     // right before vkCreateDevice: appends every feature Voxy uses that the physical device
     // supports, then records in VkDeviceFeatures what the device will have enabled.

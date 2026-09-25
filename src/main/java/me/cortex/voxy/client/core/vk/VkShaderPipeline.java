@@ -320,11 +320,16 @@ public final class VkShaderPipeline {
     }
 
     //Deferred: frames still in flight may reference the pipeline (MC keeps up to two
-    // submissions in flight), so it is destroyed only once the current frame retires.
+    // submissions in flight), so it is destroyed only once they have completed.
     // The descriptor set layout is interned and owned by the VulkanContext.
     public void free() {
         if (this.freed) return;
         this.freed = true;
-        this.ctx.deferDestroyPipeline(this.pipeline, this.pipelineLayout);
+        var device = this.ctx.vk().device;
+        long pipeline = this.pipeline, pipelineLayout = this.pipelineLayout;
+        this.ctx.deferDestroy(() -> {
+            vkDestroyPipeline(device, pipeline, null);
+            vkDestroyPipelineLayout(device, pipelineLayout, null);
+        });
     }
 }

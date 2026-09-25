@@ -159,15 +159,19 @@ public final class VkImage2D {
     }
 
     public void free() {
-        if (this.mipViews != null) {
-            for (long v : this.mipViews) {
-                this.ctx.deferDestroyImage(0, v, 0);
+        var device = this.ctx.vk().device;
+        long image = this.image, view = this.view, memory = this.memory;
+        long[] mipViews = this.mipViews;
+        long[] extraViews = this.extraViews.stream().mapToLong(Long::longValue).toArray();
+        this.ctx.deferDestroy(() -> {
+            if (mipViews != null) {
+                for (long v : mipViews) vkDestroyImageView(device, v, null);
             }
-        }
-        for (long v : this.extraViews) {
-            this.ctx.deferDestroyImage(0, v, 0);
-        }
-        this.ctx.deferDestroyImage(this.image, this.view, this.memory);
+            for (long v : extraViews) vkDestroyImageView(device, v, null);
+            vkDestroyImageView(device, view, null);
+            vkDestroyImage(device, image, null);
+            vkFreeMemory(device, memory, null);
+        });
     }
 
     /** Simple sampler factory (nearest/clamped or nearest-mipmap for HiZ etc).

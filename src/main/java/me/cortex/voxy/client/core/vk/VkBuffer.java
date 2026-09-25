@@ -128,7 +128,12 @@ public class VkBuffer extends TrackedObject implements IDeviceBuffer, IRenderLis
         this.free0();
         COUNT--;
         TOTAL_SIZE -= this.size;
-        this.ctx.deferDestroy(this.buffer, this.memory);
+        var device = this.ctx.vk().device;
+        long buffer = this.buffer, memory = this.memory;
+        this.ctx.deferDestroy(() -> {
+            vkDestroyBuffer(device, buffer, null);
+            vkFreeMemory(device, memory, null);
+        });
     }
 
     public static int getCount() {

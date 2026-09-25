@@ -74,4 +74,11 @@ public interface IVkHost {
      * be inside a render pass.
      */
     void endSegment(VkCommandBuffer segment);
+
+    /**
+     * Runs {@code destroy} once the submission MC is recording now has completed on the
+     * GPU, so no frame recorded so far can still use what it destroys (MC's destruction
+     * queue; at the latest when MC closes the device).
+     */
+    void deferDestroy(Runnable destroy);
 }
