@@ -42,7 +42,7 @@ Goal of the plan: make future Minecraft ports cheaper by leaning on Blaze3D wher
 
 ## Progress
 
-Work happens on the branch `blaze3d-migration`, off `vulkan-audit-fixes`. Sections 2–4 and Appendix A describe the code as audited at `ee85c6f8`; this table lists what has changed since.
+Work happens on the branch `blaze3d-migration`, off `vulkan-audit-fixes`. Everything up to and including 2.2, the LOD blanking fixes and the draw-budget rework was released as **0.2.22+mc26.2**; 4.1 onward is 0.2.23+mc26.2. Sections 2–4 and Appendix A describe the code as audited at `ee85c6f8`; this table lists what has changed since.
 
 | Step | Status | Commit |
 |---|---|---|

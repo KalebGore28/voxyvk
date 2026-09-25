@@ -9,6 +9,10 @@ and this project uses versioning in the format `MAJOR.MINOR.PATCH+mcVERSION`.
 
 ## [Unreleased]
 
+## [0.2.22+mc26.2] - 2026-09-25
+
+Blaze3D migration phases 0-2 on the Vulkan backend (see `BLAZE3D_MIGRATION_AUDIT.md`), plus fixes for LODs blanking on Vulkan and for the Mac frame rate. Tested in-game on an M2 Max (MoltenVK).
+
 ### Added
 - Vulkan: F3 shows how long Voxy's frame takes on the GPU (the `GpuTime` lines) while the `voxy:gpu_debug` debug entry is showing (F3+F6 to set it), as on OpenGL. It is measured with Minecraft's public GPU timestamp queries. The first line has the frame total, averaged over the last second, and the worst frame in that second; the lines below split it into Voxy's passes. On Apple GPUs only the total is reliable: Metal takes a timestamp after a draw pass while the draws still run, so their time shows under a later pass. Voxy only measures while the lines are on screen, which splits its frame into one command buffer per pass
 
