@@ -8,7 +8,6 @@ import com.mojang.blaze3d.vulkan.VulkanDevice;
 import com.mojang.blaze3d.vulkan.VulkanGpuTexture;
 import com.mojang.blaze3d.vulkan.VulkanGpuTextureView;
 import com.mojang.blaze3d.vulkan.init.VulkanFeature;
-import me.cortex.voxy.client.mixin.vk.AccessorVulkanCommandEncoder;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.KHRDynamicRendering;
 import org.lwjgl.vulkan.KHRPushDescriptor;
@@ -25,16 +24,18 @@ import org.lwjgl.vulkan.VkQueue;
 import java.util.Collection;
 import java.util.Set;
 
+import static me.cortex.voxy.client.core.vk.VkUtil.check;
 import static org.lwjgl.system.MemoryStack.stackPush;
+import static org.lwjgl.vulkan.VK10.vkEndCommandBuffer;
 import static org.lwjgl.vulkan.VK13.VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 
 //IVkHost backed by MC 26.2's live Blaze3D Vulkan device. The device-level
 // handles (instance/physical device/device/queue+family) are pulled directly
-// from MC's VulkanDevice and are stable for the device lifetime. The per-frame
-// command buffer is resolved live from MC's persistent command encoder; the
-// world colour/depth attachments are passed straight to the render core each
-// frame from the Sodium hook's output target, so the adapter holds no per-frame
-// state.
+// from MC's VulkanDevice and are stable for the device lifetime. Voxy's per-frame
+// command buffers come from MC's persistent command encoder and are spliced into
+// its submission; the world colour/depth attachments are passed straight to the
+// render core each frame from the Sodium hook's output target, so the adapter
+// holds no per-frame state.
 //
 //This is the only class outside client/mixin/vk that may use Blaze3D's Vulkan
 // backend classes (com.mojang.blaze3d.vulkan.*), see IVkHost.
@@ -70,13 +71,18 @@ public final class MinecraftVkHostAdapter implements IVkHost {
     @Override public long vkImageView(GpuTextureView view) { return ((VulkanGpuTextureView) view).vkImageView(); }
     @Override public int vkFormat(GpuFormat format) { return VulkanConst.toVk(format); }
 
+    //createCommandEncoder() returns MC's single persistent encoder (it does not create
+    // one). Its allocate-and-begin + execute pair is how MC itself splices extra command
+    // buffers into a frame (VulkanTransientMemory, VulkanGpuSurface).
     @Override
-    public VkCommandBuffer frameCommandBuffer() {
-        //createCommandEncoder() returns MC's single persistent encoder (it does not
-        // create one). This is the command buffer it is currently recording into;
-        // null when MC has recorded nothing since it last ended one.
-        var encoder = (AccessorVulkanCommandEncoder) (Object) this.device.createCommandEncoder();
-        return encoder.voxy$currentCommandBuffer();
+    public VkCommandBuffer beginSegment() {
+        return this.device.createCommandEncoder().allocateAndBeginTransientCommandBuffer();
+    }
+
+    @Override
+    public void endSegment(VkCommandBuffer segment) {
+        check(vkEndCommandBuffer(segment), "vkEndCommandBuffer(segment)");
+        this.device.createCommandEncoder().execute(segment);
     }
 
     @Override

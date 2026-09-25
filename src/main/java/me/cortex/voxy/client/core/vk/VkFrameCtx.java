@@ -24,11 +24,13 @@ import static org.lwjgl.vulkan.VK12.vkGetSemaphoreCounterValue;
 
 //The per-frame Vulkan recording context for the pure-VK path.
 //
-//ALL of Voxy's GPU work is recorded into MC's live frame command buffer between
-// MC's own render passes (upload copies -> compute -> raster passes -> draws ->
-// readback copies), ordered with pipeline barriers. This class owns:
+//ALL of Voxy's GPU work in a frame is recorded into one command buffer from MC's
+// per-submit pool, which endFrame splices into MC's frame submission right after
+// what MC recorded before the render hook (VulkanCommandEncoder.execute, through
+// IVkHost). Inside it: upload copies -> compute -> raster passes -> draws ->
+// readback copies, ordered with pipeline barriers. This class owns:
 //
-//  - the current recording target (cmd()), either MC's frame command buffer
+//  - the current recording target (cmd()), either the frame's command buffer
 //    (inside the render hook) or a one-shot immediate buffer (resource
 //    construction outside a frame);
 //  - frame completion tracking: each Voxy frame ends by asking MC's encoder
@@ -41,7 +43,7 @@ import static org.lwjgl.vulkan.VK12.vkGetSemaphoreCounterValue;
 //  - two invariants MC's command stream relies on: MC ends every operation with a
 //    full memory barrier and never emits one before a pass, so Voxy's frame ends
 //    the same way; and a rendering instance left open by an exception is closed
-//    before the command buffer goes back to MC.
+//    before the command buffer is spliced into MC's frame.
 //
 //Thread model: render thread only (MC records its VK frame on its render thread);
 // enforced in cmd().
@@ -55,7 +57,7 @@ public final class VkFrameCtx {
     private final IVkHost host;
     private final Thread ownerThread;
     private final long timeline;           //timeline semaphore, signalled with each frame's index
-    private VkCommandBuffer frameCmd;      //MC's frame command buffer while inside the hook
+    private VkCommandBuffer frameCmd;      //the frame's command buffer while inside the hook
     private VkCommandBuffer immediateCmd;  //one-shot fallback outside the hook
     private boolean anyWorkThisFrame;
     private boolean renderingActive;       //a vkCmdBeginRenderingKHR without its end has been recorded
@@ -102,22 +104,22 @@ public final class VkFrameCtx {
     //==================================================================================
     // Recording targets
 
-    /** Enter the render hook: record into MC's frame command buffer. */
-    public void beginFrame(VkCommandBuffer mcFrameCommandBuffer) {
+    /** Enter the render hook: begin the frame's command buffer (from MC's per-submit pool). */
+    public void beginFrame() {
         if (this.frameCmd != null) throw new IllegalStateException("Frame already begun");
-        if (mcFrameCommandBuffer == null) throw new IllegalArgumentException("No MC frame command buffer");
-        this.frameCmd = mcFrameCommandBuffer;
+        this.frameCmd = this.host.beginSegment();
     }
 
-    /** Leave the render hook: close anything left open, restore MC's barrier invariant, schedule the retire signal. */
+    /** Leave the render hook: close anything left open, restore MC's barrier invariant, splice the frame into MC's submission, schedule the retire signal. */
     public void endFrame() {
         if (this.frameCmd == null) throw new IllegalStateException("No frame begun");
+        var cmd = this.frameCmd;
         try {
             if (this.renderingActive) {
-                //Only reachable when recording threw mid-pass. MC would otherwise record
-                // its next passes (and Voxy its barrier) inside Voxy's rendering instance.
+                //Only reachable when recording threw mid-pass; a command buffer can only
+                // end outside a rendering instance
                 Logger.error("Voxy VK frame ended inside a rendering instance; closing it");
-                vkCmdEndRenderingKHR(this.frameCmd);
+                vkCmdEndRenderingKHR(cmd);
                 this.renderingActive = false;
             }
             if (this.anyWorkThisFrame) {
@@ -125,20 +127,25 @@ public final class VkFrameCtx {
                 // next pass is ordered after Voxy's writes to MC's colour/depth only if
                 // Voxy's frame ends the same way
                 this.fullBarrier();
-                //Ends MC's current command buffer; the signal fires once everything
-                // recorded so far (MC's work and Voxy's frame) has executed
-                this.host.signalSemaphore(this.timeline, this.frameCounter);
-                this.lastSignaled = this.frameCounter;
-                this.frameCounter++;
-                this.anyWorkThisFrame = false;
             }
         } finally {
             this.frameCmd = null;
+            //Spliced in even when recording threw: uploads and readbacks already handed
+            // out this frame must still run
+            this.host.endSegment(cmd);
+        }
+        if (this.anyWorkThisFrame) {
+            //Queued after the spliced frame: fires once everything recorded so far (MC's
+            // work and Voxy's frame) has executed
+            this.host.signalSemaphore(this.timeline, this.frameCounter);
+            this.lastSignaled = this.frameCounter;
+            this.frameCounter++;
+            this.anyWorkThisFrame = false;
         }
     }
 
-    //The command buffer to record into. Inside the render hook this is MC's
-    // frame command buffer; outside it, a one-shot immediate command buffer is
+    //The command buffer to record into. Inside the render hook this is the
+    // frame's command buffer; outside it, a one-shot immediate command buffer is
     // begun on demand and submitted synchronously by flushImmediate().
     public VkCommandBuffer cmd() {
         if (Thread.currentThread() != this.ownerThread) {

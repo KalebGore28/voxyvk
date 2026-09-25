@@ -21,8 +21,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 // is bypassed. Sodium instead draws through SodiumWorldRenderer#drawChunkLayer.
 // We therefore trigger Voxy's frame at the TAIL of drawChunkLayer for the
 // OPAQUE group: Sodium's opaque terrain has just been drawn, its render pass
-// is closed, the frame command buffer is recording, and MC's depth buffer
-// holds vanilla terrain — exactly the state Voxy's VK frame needs.
+// is closed (so Voxy's frame can be spliced into MC's submission here), and MC's
+// depth buffer holds vanilla terrain — exactly the state Voxy's VK frame needs.
 @Mixin(value = SodiumWorldRenderer.class, remap = false)
 public class MixinSodiumOpaqueVkFrame {
 
@@ -30,14 +30,13 @@ public class MixinSodiumOpaqueVkFrame {
     private void voxy$renderVkFrame(ChunkSectionLayerGroup group, ChunkRenderMatrices matrices,
                                     double x, double y, double z, GpuSampler sampler, CallbackInfo ci) {
         if (group != ChunkSectionLayerGroup.OPAQUE) return;
-        var host = MinecraftVkHost.get();
-        if (host == null) return;
+        if (MinecraftVkHost.get() == null) return;
 
         var renderer = IVoxyRenderSystemHolder.getNullable();
         if (renderer == null || renderer.vkCore == null) return;
 
         try {
-            renderer.vkCore.renderFrame(group.outputTarget(), host, matrices, x, y, z);
+            renderer.vkCore.renderFrame(group.outputTarget(), matrices, x, y, z);
         } catch (Throwable t) {
             //Never take down MC's frame; log loudly instead
             Logger.error("Voxy VK frame failed", t);

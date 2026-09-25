@@ -14,7 +14,6 @@ import me.cortex.voxy.client.core.rendering.bounding.StreamedBoundStore;
 import me.cortex.voxy.client.core.rendering.hierachical.AsyncNodeManager;
 import me.cortex.voxy.client.core.rendering.util.AbstractDownloadStream;
 import me.cortex.voxy.client.core.rendering.util.AbstractUploadStream;
-import me.cortex.voxy.client.core.vk.IVkHost;
 import me.cortex.voxy.client.core.vk.MinecraftVkHost;
 import me.cortex.voxy.client.core.vk.VkBuffer;
 import me.cortex.voxy.client.core.vk.VkDownloadStream;
@@ -39,9 +38,9 @@ import java.util.List;
 // shares the CPU-side services (node manager, mesh generation, model bakery,
 // render-distance tracking) with the GL path.
 //
-//Everything records into MC's frame command buffer from the render hook
-// (MixinSodiumOpaqueVkFrame, TAIL of Sodium's opaque terrain draw), between
-// MC's opaque terrain pass and the rest of its frame. No OpenGL is touched.
+//Everything records from the render hook (MixinSodiumOpaqueVkFrame, TAIL of
+// Sodium's opaque terrain draw) into a command buffer spliced into MC's frame
+// between MC's opaque terrain pass and the rest of it. No OpenGL is touched.
 public class VkRenderCore {
     private final WorldEngine worldIn;
     private final VkFrameCtx frameCtx;
@@ -185,8 +184,8 @@ public class VkRenderCore {
         return capacity & ~7L;//VkSectionGeometryData requires a multiple of 8
     }
 
-    //Renders one Voxy frame into MC's frame command buffer. Called from the
-    // render hook right after MC's opaque terrain pass, on the render thread.
+    //Renders one Voxy frame, spliced into MC's frame right after MC's opaque
+    // terrain pass (VkFrameCtx). Called from the render hook, on the render thread.
     //
     //matrices are Sodium's per-frame ChunkRenderMatrices — the exact
     // projection+modelView MC/Sodium just drew the terrain with, INCLUDING
@@ -195,18 +194,13 @@ public class VkRenderCore {
     // bob delta as rawMCProj^-1 x base, which collapses to identity if base IS
     // rawMCProj, and viewRotationMatrix is rotation-only — both of which made
     // the LODs bounce relative to vanilla terrain while walking.
-    public void renderFrame(RenderTarget target, IVkHost host, ChunkRenderMatrices matrices,
+    public void renderFrame(RenderTarget target, ChunkRenderMatrices matrices,
                             double camX, double camY, double camZ) {
-        var frameCmd = host.frameCommandBuffer();
-        if (frameCmd == null) {
-            Logger.warn("Voxy VK: no frame command buffer at hook point, skipping frame");
-            return;
-        }
         var crs = Minecraft.getInstance().gameRenderer.gameRenderState().levelRenderState.cameraRenderState;
         if (crs == null || !crs.initialized) return;
 
         this.frameCtx.flushImmediate();
-        this.frameCtx.beginFrame(frameCmd);
+        this.frameCtx.beginFrame();
         try {
             if (me.cortex.voxy.commonImpl.VoxyCommon.IS_MINE_IN_ABYSS) {//same camera trickery as the GL setupViewport
                 int sector = (((int) Math.floor(camX) >> 4) + 512) >> 10;

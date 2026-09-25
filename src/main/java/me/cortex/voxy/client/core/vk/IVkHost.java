@@ -26,7 +26,8 @@ import org.lwjgl.vulkan.VkQueue;
  *      (VkFrameHost.MC_IMAGE_LAYOUT)
  *  D2  MC orders its work only by the full barrier each of its operations ends with,
  *      so Voxy's frame must end with one too (VkFrameCtx.endFrame)
- *  D3  at the Sodium OPAQUE hook MC's command buffer is open and no render pass is active
+ *  D3  at the Sodium OPAQUE hook no render pass is active, so Voxy's frame can be
+ *      spliced into MC's submission there (VkFrameCtx.endFrame)
  *  D4  MC submits once per frame, at the end of Minecraft.renderFrame, with at most
  *      two submissions in flight
  *  D5  MC enables push descriptors, dynamic rendering and timeline semaphores, which
@@ -60,8 +61,19 @@ public interface IVkHost {
     /** The VkFormat MC creates images of this Blaze3D format with. */
     int vkFormat(GpuFormat format);
 
-    /** Command buffer currently recording for this frame's world rendering, at the LOD injection point. */
-    VkCommandBuffer frameCommandBuffer();
+    /**
+     * Begins a command buffer from the pool of MC's current submission (MC resets that
+     * pool only after the submission has completed). Must be passed to endSegment.
+     */
+    VkCommandBuffer beginSegment();
+
+    /**
+     * Ends {@code segment} and splices it into MC's pending submission: MC ends the
+     * command buffer it is recording first, so the segment runs after everything MC
+     * recorded before this call and before anything MC records after it. MC must not
+     * be inside a render pass.
+     */
+    void endSegment(VkCommandBuffer segment);
 
     /**
      * Appends a timeline-semaphore signal to MC's pending queue submission. MC ends
