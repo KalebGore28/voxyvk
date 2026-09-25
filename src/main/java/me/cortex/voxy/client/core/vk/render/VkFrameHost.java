@@ -1,9 +1,8 @@
 package me.cortex.voxy.client.core.vk.render;
 
 import com.mojang.blaze3d.textures.GpuTextureView;
-import com.mojang.blaze3d.vulkan.VulkanConst;
-import com.mojang.blaze3d.vulkan.VulkanGpuTexture;
-import com.mojang.blaze3d.vulkan.VulkanGpuTextureView;
+import me.cortex.voxy.client.core.vk.IVkHost;
+import me.cortex.voxy.client.core.vk.MinecraftVkHost;
 import net.minecraft.client.Minecraft;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VkCommandBuffer;
@@ -27,17 +26,23 @@ public final class VkFrameHost {
 
     private VkFrameHost() {}
 
+    private static IVkHost host() {
+        var host = MinecraftVkHost.get();
+        if (host == null) throw new IllegalStateException("No Minecraft Vulkan host registered");
+        return host;
+    }
+
     /** VkImageView of MC's lightmap (bound as Voxy's terrain light sampler, layout MC_IMAGE_LAYOUT). */
     public static long lightmapView() {
-        return ((VulkanGpuTextureView) Minecraft.getInstance().gameRenderer.levelLightmap()).vkImageView();
+        return host().vkImageView(Minecraft.getInstance().gameRenderer.levelLightmap());
     }
 
     public static long vkView(GpuTextureView view) {
-        return ((VulkanGpuTextureView) view).vkImageView();
+        return host().vkImageView(view);
     }
 
     public static int vkFormat(GpuTextureView view) {
-        return VulkanConst.toVk(view.texture().getFormat());
+        return host().vkFormat(view.texture().getFormat());
     }
 
     //Execution + memory dependency on one of MC's colour/depth images. The layout
@@ -46,7 +51,7 @@ public final class VkFrameHost {
     public static void mcImageBarrier(VkCommandBuffer cmd, GpuTextureView view, boolean depth,
                                       int srcStage, int srcAccess, int dstStage, int dstAccess) {
         try (MemoryStack stack = stackPush()) {
-            long image = ((VulkanGpuTexture) view.texture()).vkImage();
+            long image = host().vkImage(view.texture());
             var imb = VkImageMemoryBarrier.calloc(1, stack).sType$Default()
                     .srcAccessMask(srcAccess).dstAccessMask(dstAccess)
                     .oldLayout(MC_IMAGE_LAYOUT).newLayout(MC_IMAGE_LAYOUT)

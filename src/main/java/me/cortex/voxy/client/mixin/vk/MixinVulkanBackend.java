@@ -3,7 +3,7 @@ package me.cortex.voxy.client.mixin.vk;
 import com.mojang.blaze3d.vulkan.VulkanBackend;
 import com.mojang.blaze3d.vulkan.VulkanPhysicalDevice;
 import com.mojang.blaze3d.vulkan.init.VulkanFeature;
-import me.cortex.voxy.client.core.vk.VkDeviceFeatures;
+import me.cortex.voxy.client.core.vk.MinecraftVkHostAdapter;
 import me.cortex.voxy.common.Logger;
 import org.lwjgl.vulkan.VkDevice;
 import org.spongepowered.asm.mixin.Mixin;
@@ -26,7 +26,7 @@ public class MixinVulkanBackend {
     private static void voxy$requestDeviceFeatures(Collection<String> extensions, VulkanPhysicalDevice physicalDevice,
                                                    Set<VulkanFeature> features, CallbackInfoReturnable<VkDevice> cir) {
         try {
-            VkDeviceFeatures.requestOn(physicalDevice.vkPhysicalDevice(), features);
+            MinecraftVkHostAdapter.requestDeviceFeatures(physicalDevice.vkPhysicalDevice(), features);
         } catch (Throwable t) {
             //Never break MC's device creation; Voxy's VK path will report the missing features
             Logger.warn("Voxy: failed to request Vulkan device features: " + t);

@@ -14,8 +14,8 @@ import me.cortex.voxy.client.core.rendering.bounding.StreamedBoundStore;
 import me.cortex.voxy.client.core.rendering.hierachical.AsyncNodeManager;
 import me.cortex.voxy.client.core.rendering.util.AbstractDownloadStream;
 import me.cortex.voxy.client.core.rendering.util.AbstractUploadStream;
+import me.cortex.voxy.client.core.vk.IVkHost;
 import me.cortex.voxy.client.core.vk.MinecraftVkHost;
-import me.cortex.voxy.client.core.vk.MinecraftVkHostAdapter;
 import me.cortex.voxy.client.core.vk.VkBuffer;
 import me.cortex.voxy.client.core.vk.VkDownloadStream;
 import me.cortex.voxy.client.core.vk.VkFrameCtx;
@@ -195,9 +195,9 @@ public class VkRenderCore {
     // bob delta as rawMCProj^-1 x base, which collapses to identity if base IS
     // rawMCProj, and viewRotationMatrix is rotation-only — both of which made
     // the LODs bounce relative to vanilla terrain while walking.
-    public void renderFrame(RenderTarget target, MinecraftVkHostAdapter adapter, ChunkRenderMatrices matrices,
+    public void renderFrame(RenderTarget target, IVkHost host, ChunkRenderMatrices matrices,
                             double camX, double camY, double camZ) {
-        var frameCmd = adapter.frameCommandBuffer();
+        var frameCmd = host.frameCommandBuffer();
         if (frameCmd == null) {
             Logger.warn("Voxy VK: no frame command buffer at hook point, skipping frame");
             return;
