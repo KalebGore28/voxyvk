@@ -9,6 +9,8 @@ and this project uses versioning in the format `MAJOR.MINOR.PATCH+mcVERSION`.
 
 ## [Unreleased]
 
+## [0.2.21+mc26.2] - 2026-09-25
+
 ### Changed
 - Updated documentation to clarify license restrictions (no binary redistribution)
 - Removed automated release workflow to comply with license
