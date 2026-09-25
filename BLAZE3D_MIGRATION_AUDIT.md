@@ -46,10 +46,10 @@ Work happens on the branch `blaze3d-migration`, off `vulkan-audit-fixes`. Sectio
 
 | Step | Status | Commit |
 |---|---|---|
-| 2.3 Async atlas readback via Blaze3D | Done, needs in-game testing | `1ce62302` |
+| 2.3 Async atlas readback via Blaze3D | Done, tested in-game (see below) | `1ce62302` |
 | 0.1 Blaze3D-VK classes only in `MinecraftVkHostAdapter` + `mixin/vk` | Done | `6fc22f19` |
 | 0.2 Contracts D1–D11 on `IVkHost`; D5 checked at device creation | Done | `b81829ec` |
-| 1.1 Frame spliced in with `execute()`; `AccessorVulkanCommandEncoder` deleted | Done, needs in-game testing | `16678071` |
+| 1.1 Frame spliced in with `execute()`; `AccessorVulkanCommandEncoder` deleted | Done, tested in-game (see below) | `16678071` |
 | 1.2 Frame retirement through `GpuFence` | Next | |
 | 1.3 MC's destruction queue for deferred destroys | Next | |
 | 1.4 Allocations through MC's VMA | Next | |
@@ -59,6 +59,12 @@ In-game checks for the finished steps:
 - The built jar in the Modrinth App on the M2 Max.
 - World join/leave twice, and a resource-pack reload (F3+T). LODs should appear a frame or two after joining or reloading, with correct block textures.
 - A GL (Default) regression check.
+
+Tested 2026-09-25 (jar `1667807`, M2 Max, Vulkan/MoltenVK, a server with a large pregenerated LOD set, heavily modded profile):
+- Rendering was correct, with no noticeable performance change.
+- The log has none of the new code's failure messages, and the startup feature check passed.
+- The renderer was built, rebuilt when the server set the view distance (pre-existing behaviour), and shut down cleanly.
+- Not reported yet: the F3+T reload and the GL regression check.
 
 ---
 
