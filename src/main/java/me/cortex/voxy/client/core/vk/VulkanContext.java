@@ -1,5 +1,6 @@
 package me.cortex.voxy.client.core.vk;
 
+import com.mojang.blaze3d.systems.RenderSystem;
 import me.cortex.voxy.common.Logger;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.util.vma.VmaBudget;
@@ -8,7 +9,6 @@ import org.lwjgl.vulkan.VkDevice;
 import org.lwjgl.vulkan.VkFormatProperties;
 import org.lwjgl.vulkan.VkInstance;
 import org.lwjgl.vulkan.VkPhysicalDevice;
-import org.lwjgl.vulkan.VkPhysicalDeviceMaintenance3Properties;
 import org.lwjgl.vulkan.VkPhysicalDeviceMemoryProperties;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
 import org.lwjgl.vulkan.VkPhysicalDeviceSubgroupProperties;
@@ -35,7 +35,9 @@ import static org.lwjgl.vulkan.VK11.*;
 //
 //Capabilities are what the ADOPTED device can legally use: device features come
 // from what MC actually enabled (VkDeviceFeatures, fed by MixinVulkanBackend), not
-// from physical-device support.
+// from physical-device support. Name, vendor and the limits Blaze3D reports come from
+// its public DeviceInfo; only what it lacks (subgroups, storage-buffer range and
+// alignment, depth-stencil formats, memory heaps) is queried from Vulkan here.
 public final class VulkanContext {
     public final VkInstance instance;
     public final VkPhysicalDevice physicalDevice;
@@ -77,20 +79,19 @@ public final class VulkanContext {
         }
         this.hasDrawIndirectCount = VkDeviceFeatures.drawIndirectCount();
 
-        String name;
+        var info = RenderSystem.getDevice().getDeviceInfo();
+        this.maxMemoryAllocationSize = info.limits().maxMemoryAllocationSize();
+        this.uniformAlign = info.limits().minUniformOffsetAlignment();
         try (MemoryStack stack = stackPush()) {
             //Subgroup support is a PROPERTY: it must be chained into
             // VkPhysicalDeviceProperties2 (chaining it into the features query, as
             // this did before, leaves it zeroed and silently disables every
             // subgroup path)
             var subgroup = VkPhysicalDeviceSubgroupProperties.calloc(stack).sType$Default();
-            var maintenance3 = VkPhysicalDeviceMaintenance3Properties.calloc(stack).sType$Default()
-                    .pNext(subgroup.address());
             var props2 = VkPhysicalDeviceProperties2.calloc(stack).sType$Default()
-                    .pNext(maintenance3.address());
+                    .pNext(subgroup.address());
             vkGetPhysicalDeviceProperties2(this.physicalDevice, props2);
             var props = props2.properties();
-            name = props.deviceNameString();
 
             int ops = subgroup.supportedOperations();
             boolean compute = (subgroup.supportedStages() & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
@@ -101,9 +102,7 @@ public final class VulkanContext {
 
             var limits = props.limits();
             this.maxStorageBufferRange = Integer.toUnsignedLong(limits.maxStorageBufferRange());
-            this.maxMemoryAllocationSize = maintenance3.maxMemoryAllocationSize();
             this.storageAlign = limits.minStorageBufferOffsetAlignment();
-            this.uniformAlign = limits.minUniformBufferOffsetAlignment();
 
             this.depthStencilFormat = pickDepthStencilFormat(stack, this.physicalDevice);
 
@@ -119,13 +118,17 @@ public final class VulkanContext {
             check(vkCreatePipelineCache(this.device, pcci, null, pCache), "vkCreatePipelineCache");
             this.pipelineCache = pCache.get(0);
         }
-        this.deviceName = name + " (MC host)";
+        this.deviceName = info.name() + " (MC host)";
         Logger.info("Voxy Vulkan context adopted Minecraft device: " + this.deviceName
-                + " (drawIndirectCount=" + this.hasDrawIndirectCount
+                + " (vendor=" + info.vendorName()
+                + ", type=" + info.type()
+                + ", driver=" + info.driverInfo()
+                + ", drawIndirectCount=" + this.hasDrawIndirectCount
                 + ", subgroupSize=" + this.subgroupSize
                 + ", subgroupArithmetic=" + this.subgroupArithmetic
                 + ", subgroupClustered=" + this.subgroupClustered
                 + ", maxStorageBufferRange=" + this.maxStorageBufferRange
+                + ", maxMemoryAllocationSize=" + this.maxMemoryAllocationSize
                 + ", depthStencilFormat=" + this.depthStencilFormat + ")");
     }
 
