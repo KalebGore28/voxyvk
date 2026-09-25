@@ -106,14 +106,17 @@ Performance is a co-priority of the migration: a step that makes the VK path slo
   |---|---|---|---|---|
   | Straight up at the sky, SSAO better (12 spp) | 120 / 120 (vsync) | ≈ 2.2 ms | `I` 1.09, `ao` 0.67, `hiz` 0.17 | O 0/1024, X 0/256 |
   | Vista from y = 275 on a server, SSAO best (24 spp); 1,331 of 4,095 MB geometry, 98k nodes | 70 / 39 | ≈ 12.2 ms | `I` 8.02 (mostly the opaque draw), `ao` 2.26, `hiz` 0.93, `comp` 0.39, `CG` 0.35 | O 28,054/43,105, X 3,394/5,347 |
+  | Same spot, facing about 30° further south, SSAO auto (12 spp), shortly after a quick turn; 2,121 MB geometry, 162k nodes (jar `1fb6a3a`) | 45 / 25 | 17.2 ms | `I` 12.43, `ao` 2.71, `comp` 0.77, `hiz` 0.78, `CG` 0.41 | O 37,005/98,888, T 0/63,745, X 5,088/13,148 |
 
   At 70 fps a frame lasts about 14 ms, so in the vista Voxy's GPU work is most of the frame: the game is GPU-bound there.
+
+  The second row exposed the 8 s any-direction hold of `e0c6544d`. After a quick turn the temporal pass had briefly drawn about 42k sections, and every pass then kept its peak: 176k Metal draws per frame, 133k of them empty. `ao` rose although SSAO's samples were halved, because on Apple GPUs it also absorbs the temporal pass, here 63,745 empty draws. That puts an empty draw's GPU cost somewhere around 20–25 ns, before MoltenVK's CPU encoding. `cff6763e` sizes the budgets by view direction; a simulation of the same view gives 47k opaque slots instead of 99k.
 - **Next measurements** (same spot, one change at a time, compare the total):
   1. Shrink the window to about half width and height. If the total drops by half or more, per-pixel work (LOD fragments, SSAO, HiZ, composite) dominates; if it barely moves, per-draw and per-vertex work does.
   2. SSAO `best` → `auto` (12 spp at this size) or `basic`.
-  3. `-Dvoxy.vk.drawBudgetGrowth=1.0` shows what the ~15k empty opaque draws cost (watch `short` for dropped sections).
+  3. `-Dvoxy.vk.drawBudgetGrowth=1.0` (default 1.25 since `cff6763e`) shows what the remaining empty draws cost (watch `short` for dropped sections).
 - **Known costs on MoltenVK (the M2 Max):**
-  - MoltenVK has no indirect-count draws, so every budget slot is one Metal draw, empty ones included, encoded on the render thread inside MC's submit. The budget is the largest count of the last 8 s × 1.5 plus headroom (1024 opaque, 256 temporal/translucent). The × 1.5 predates the 8 s hold (`e0c6544d`) and could come down if `short` stays at 0.
+  - MoltenVK has no indirect-count draws, so every budget slot is one Metal draw, empty ones included, encoded on the render thread inside MC's submit. Since `cff6763e` the budget is sized by view direction: counts from the last 8 s within 30° of the list being drawn (or from anywhere right after a quick turn into a new view), × 1.25, plus headroom (1024 opaque, 256 temporal/translucent). The temporal pass is sized from the turn and FOV change since the last list. `-Dvoxy.vk.drawBudgetGrowth` overrides the 1.25.
   - Since `719c29c1` the geometry buffer is about 4 GiB instead of 2 GB, so more detail stays resident and is drawn. That costs frames, but it is what GL does too.
 - **Rules for the remaining steps:**
   - Every Blaze3D encoder operation ends with a full barrier (D2). Don't route per-item work through Blaze3D calls without batching it: for example 3.1's model-atlas uploads, which would be one `writeToTexture` per region. Compare `GpuTime` before and after.
