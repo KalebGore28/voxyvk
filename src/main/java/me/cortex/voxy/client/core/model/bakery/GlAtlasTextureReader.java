@@ -3,6 +3,8 @@ package me.cortex.voxy.client.core.model.bakery;
 import com.mojang.blaze3d.opengl.GlTexture;
 import com.mojang.blaze3d.textures.GpuTexture;
 
+import java.util.function.Consumer;
+
 import static org.lwjgl.opengl.ARBDirectStateAccess.glGetTextureImage;
 import static org.lwjgl.opengl.GL11.*;
 import static org.lwjgl.opengl.GL11C.GL_RGBA;
@@ -17,7 +19,12 @@ import static org.lwjgl.opengl.GL30C.glBindFramebuffer;
 // only on the GL backend (see IAtlasTextureReader).
 final class GlAtlasTextureReader extends IAtlasTextureReader {
     @Override
-    public int[] read(GpuTexture tex, int width, int height) {
+    public void readAsync(GpuTexture tex, int width, int height, Consumer<int[]> onReady) {
+        //Synchronous on GL: read() waits for the GPU (glFinish), so the result is ready now
+        onReady.accept(read(tex, width, height));
+    }
+
+    private static int[] read(GpuTexture tex, int width, int height) {
         //Just do it ourselves as doing it with b3d has some issues, (doing it ourselves is also just much much much shorter)
         var texture = new int[width * height];
         glFlush();

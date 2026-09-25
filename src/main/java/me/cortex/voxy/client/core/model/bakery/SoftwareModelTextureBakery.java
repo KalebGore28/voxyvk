@@ -42,11 +42,21 @@ public class SoftwareModelTextureBakery {
     private final SoftwareRasterizer rasterizer = new SoftwareRasterizer(ModelFactory.MODEL_TEXTURE_SIZE);
 
     private final FluidRenderer fr;
+    //Set once the rasterizer has the block atlas (see setupTexture). The volatile write
+    // publishes the sampler texture to the baking thread, which must not bake before it
+    private volatile boolean textureReady;
+
     public SoftwareModelTextureBakery() {
         this.fr = new FluidRenderer(Minecraft.getInstance().getModelManager().getFluidStateModelSet());
     }
 
-    public void setupTexture() {
+    public boolean isTextureReady() {
+        return this.textureReady;
+    }
+
+    //Starts reading MC's block atlas back for the rasterizer; onReady runs on the render
+    // thread once it has arrived (right away on GL, about a frame later on Vulkan)
+    public void setupTexture(Runnable onReady) {
         var tex = Minecraft.getInstance().getTextureManager().getTexture(Identifier.fromNamespaceAndPath("minecraft", "textures/atlas/blocks.png")).getTexture();
         if (tex.getFormat() != GpuFormat.RGBA8_UNORM) {
             throw new IllegalStateException("Block atlas not rgba8: " + tex.getFormat());
@@ -58,11 +68,14 @@ public class SoftwareModelTextureBakery {
         int height = tex.getHeight(targetMipLevel);
 
         //Read MC's atlas back to the CPU through the active backend (GL
-        // glGetTextureImage or VK vkCmdCopyImageToBuffer). This class is shared
+        // glGetTextureImage, or a Blaze3D copy on Vulkan). This class is shared
         // and must stay GL-free so it can load when MC is on Vulkan — the
         // readback lives behind the IAtlasTextureReader seam.
-        var texture = IAtlasTextureReader.INSTANCE().read(tex, width, height);
-        this.rasterizer.setSamplerTexture(texture, width, height);
+        IAtlasTextureReader.INSTANCE().readAsync(tex, width, height, texture -> {
+            this.rasterizer.setSamplerTexture(texture, width, height);
+            this.textureReady = true;
+            onReady.run();
+        });
     }
 
     private void bakeBlockModel(BlockState state) {

@@ -99,11 +99,6 @@ public final class VkFrameCtx {
         return this.frameCounter;
     }
 
-    /** True while inside the render hook (commands go into MC's frame command buffer). */
-    public boolean isRecordingFrame() {
-        return this.frameCmd != null;
-    }
-
     //==================================================================================
     // Recording targets
 

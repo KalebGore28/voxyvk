@@ -10,10 +10,11 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 //Frame boundary for the Vulkan path. MC submits its command buffer once per frame,
 // at the end of renderFrame, so at its HEAD everything MC recorded so far has been
-// submitted and nothing new has been recorded. A Voxy Vulkan renderer requested
-// mid-frame is created here instead (see MixinLevelRenderer.voxy$createRenderer):
-// the work its construction submits immediately (e.g. the block-atlas readback) is
-// then ordered after all of MC's pending GPU work.
+// submitted and no render pass is open. A Voxy Vulkan renderer requested mid-frame
+// is created here instead (see MixinLevelRenderer.voxy$createRenderer): the
+// block-atlas copy its construction records into MC's command stream lands outside
+// any render pass, and the work it submits on its own is ordered after all of MC's
+// submitted GPU work.
 @Mixin(Minecraft.class)
 public class MixinMinecraftFrameStart {
     @Inject(method = "renderFrame", at = @At("HEAD"))

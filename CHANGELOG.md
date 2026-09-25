@@ -9,6 +9,9 @@ and this project uses versioning in the format `MAJOR.MINOR.PATCH+mcVERSION`.
 
 ## [Unreleased]
 
+### Changed
+- Vulkan: Minecraft's block atlas is now read back asynchronously through Blaze3D's public API. The copy is recorded into Minecraft's own command stream instead of a separate queue submission that stalled until the GPU finished, and the model bakery starts baking once the pixels arrive, about a frame later. After joining a world or reloading resources, LODs can appear a frame or two later. OpenGL still reads the atlas synchronously, as before
+
 ## [0.2.21+mc26.2] - 2026-09-25
 
 ### Changed

@@ -8,6 +8,7 @@ import me.cortex.voxy.client.core.model.ModelBakerySubsystem;
 import me.cortex.voxy.client.core.rendering.RenderDistanceTracker;
 import me.cortex.voxy.client.core.rendering.ViewportSelector;
 import me.cortex.voxy.client.core.rendering.building.RenderGenerationService;
+import me.cortex.voxy.client.core.model.bakery.Blaze3DAtlasTextureReader;
 import me.cortex.voxy.client.core.model.bakery.IAtlasTextureReader;
 import me.cortex.voxy.client.core.rendering.bounding.StreamedBoundStore;
 import me.cortex.voxy.client.core.rendering.hierachical.AsyncNodeManager;
@@ -15,7 +16,6 @@ import me.cortex.voxy.client.core.rendering.util.AbstractDownloadStream;
 import me.cortex.voxy.client.core.rendering.util.AbstractUploadStream;
 import me.cortex.voxy.client.core.vk.MinecraftVkHost;
 import me.cortex.voxy.client.core.vk.MinecraftVkHostAdapter;
-import me.cortex.voxy.client.core.vk.VkAtlasTextureReader;
 import me.cortex.voxy.client.core.vk.VkBuffer;
 import me.cortex.voxy.client.core.vk.VkDownloadStream;
 import me.cortex.voxy.client.core.vk.VkFrameCtx;
@@ -94,10 +94,9 @@ public class VkRenderCore {
 
             this.properties = RenderProperties.getRenderProperties();
 
-            //Install the VK atlas readback BEFORE the model bakery reads the block atlas
-            // (its constructor does a synchronous GPU->CPU copy)
-            IAtlasTextureReader.setInstance(
-                    new VkAtlasTextureReader(this.frameCtx));
+            //Install the Blaze3D atlas readback BEFORE the model bakery starts reading the
+            // block atlas (its constructor records the copy into MC's command stream)
+            IAtlasTextureReader.setInstance(new Blaze3DAtlasTextureReader());
             undo.push(IAtlasTextureReader::clearInstance);
 
             this.modelStore = new VkModelStore(this.frameCtx, this.uploadStream);

@@ -135,8 +135,7 @@ public class ModelFactory {
     public ModelFactory(Mapper mapper, IModelStore storage) {
         this.mapper = mapper;
         this.storage = storage;
-        this.bakery2 = new SoftwareModelTextureBakery();
-        this.bakery2.setupTexture();
+        this.bakery2 = new SoftwareModelTextureBakery();//its block atlas is set up by ModelBakerySubsystem
 
         this.rasterUV = false;
 
@@ -319,6 +318,11 @@ public class ModelFactory {
             biomeEntry = this.biomeQueue.poll();
         }
 
+        if (!this.bakery2.isTextureReady()) {
+            //Baking samples the block atlas, which is still being read back; bakes stay
+            // queued, and the readback wakes the processing thread when it arrives
+            return !this.biomeQueue.isEmpty();
+        }
         while (this.processModelResult());
         return (this.blockStatesInFlight.size()!=0)||(!this.bakeQueue.isEmpty())||!this.biomeQueue.isEmpty();
     }

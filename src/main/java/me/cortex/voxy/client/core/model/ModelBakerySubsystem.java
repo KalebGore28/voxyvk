@@ -41,6 +41,10 @@ public class ModelBakerySubsystem {
             }
             this.processingThreadException = e;
         });
+        //Baking samples MC's block atlas from a CPU copy; the processing thread idles until
+        // it arrives (right away on GL, about a frame later on Vulkan). Started before the
+        // thread so a failed setup does not leave a thread running
+        this.factory.bakery2.setupTexture(() -> LockSupport.unpark(this.processingThread));
         this.processingThread.start();
     }
 

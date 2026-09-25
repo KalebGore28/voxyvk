@@ -68,9 +68,10 @@ public abstract class MixinLevelRenderer implements IVoxyRenderSystemHolder {
         if (MinecraftVkHost.isMinecraftOnVulkan()) {
             //Vulkan: build it at the next frame boundary (MixinMinecraftFrameStart).
             // Requests can arrive mid-frame (LevelExtractor.allChanged after a resource
-            // reload), when MC still holds unsubmitted GPU work such as the new block
-            // atlas upload; construction submits its own work (the atlas readback)
-            // immediately, which would then run BEFORE MC's and read the stale atlas.
+            // reload). At the boundary MC has no render pass open, which the block-atlas
+            // copy that construction records into MC's command stream requires, and the
+            // initialisation work construction submits on its own runs after all of MC's
+            // submitted work.
             this.voxy$pendingCreate = true;
             return;
         }
