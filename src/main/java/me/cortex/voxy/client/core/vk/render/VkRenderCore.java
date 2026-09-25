@@ -317,7 +317,7 @@ public class VkRenderCore {
         this.terrainRenderer.addDebugInfo(debug);
         this.ssao.addDebugInfo(debug);
         if (DebugEntries.isGpuDebugShown()) {
-            debug.add(this.frameCtx.gpuTimingDebug());
+            debug.addAll(this.frameCtx.gpuTimingDebug());
         }
     }
 

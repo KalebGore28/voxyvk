@@ -371,11 +371,14 @@ public class VkTerrainRenderer {
     //The budget therefore covers the LARGEST count read back over the last few seconds,
     // not just the latest one: turning back to a view seen moments ago (panning between
     // a mountain side and the vista past it, or leaving a spyglass after a short zoom)
-    // needs as many draws as it did then. It then gets 50% growth plus fixed headroom.
-    // Desktop Vulkan sources the count on the GPU and always gets the cap.
+    // needs as many draws as it did then. It then gets 50% growth plus fixed headroom,
+    // for views busier than anything seen in that time; -Dvoxy.vk.drawBudgetGrowth sets
+    // the growth (1.0-4.0). Desktop Vulkan sources the count on the GPU and always gets
+    // the cap.
     private static final class DrawBudget {
         private static final int HOLD_SECONDS = 8;
         private static final long SHORT_WINDOW_MS = 10_000;
+        private static final double GROWTH = growthFromProperty();
 
         private final int headroom;
         private final int[] secondMax = new int[HOLD_SECONDS];//largest count read back per second
@@ -397,7 +400,20 @@ public class VkTerrainRenderer {
             if (!this.known) return cap;//before the first readback
             int held = 0;
             for (int count : this.secondMax) held = Math.max(held, count);
-            return (int) Math.min(cap, (long) (held * 1.5) + this.headroom);
+            return (int) Math.min(cap, (long) (held * GROWTH) + this.headroom);
+        }
+
+        private static double growthFromProperty() {
+            String value = System.getProperty("voxy.vk.drawBudgetGrowth", "");
+            if (value.isEmpty()) return 1.5;
+            try {
+                double growth = Math.max(1.0, Math.min(4.0, Double.parseDouble(value)));
+                Logger.info("Voxy VK: MoltenVK draw budget growth set to " + growth + " (voxy.vk.drawBudgetGrowth)");
+                return growth;
+            } catch (NumberFormatException e) {
+                Logger.warn("Voxy VK: ignoring invalid voxy.vk.drawBudgetGrowth=" + value);
+                return 1.5;
+            }
         }
 
         //The draw of the list cmdgen wrote in listFrame used this budget

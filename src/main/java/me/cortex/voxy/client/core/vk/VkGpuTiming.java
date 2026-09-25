@@ -3,16 +3,23 @@ package me.cortex.voxy.client.core.vk;
 import com.mojang.blaze3d.systems.GpuQueryPool;
 import com.mojang.blaze3d.systems.RenderSystem;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Locale;
 import java.util.OptionalLong;
 
 //GPU time per pass of Voxy's VK frame, from Blaze3D's public timestamp queries
 // (GpuDevice.createTimestampQueryPool, CommandEncoder.writeTimestamp, GpuQueryPool.getValues).
-// The VK counterpart of GL's GPUTiming: the same F3 entry (voxy:gpu_debug) turns it on and
-// it shows a "GpuTime: [...]" line with GL's labels where the passes match. Unlike GL's
-// decaying peak, each section shows its average over the last second, followed by the
-// average and worst frame total, so steady cost and spikes read apart.
+// The VK counterpart of GL's GPUTiming: the same F3 entry (voxy:gpu_debug) turns it on, and
+// sections use GL's labels where the passes match. Unlike GL's decaying peak, F3 shows the
+// frame total (average and worst over the last second) first, then each section's average,
+// wrapped so the line never runs under F3's right column.
+//
+//On Apple GPUs (MoltenVK) only the total is reliable. Metal samples timestamps at encoder
+// boundaries, from an empty blit pass that waits for nothing, so a timestamp after a draw
+// pass is taken while the draws still run; their time lands in the next section that has
+// to wait for them (e.g. the opaque terrain draw shows up under "I", not "RO").
 //
 //Blaze3D records a timestamp into MC's command stream, never into Voxy's command buffer, so
 // VkFrameCtx.gpuMarker splits the frame there: the Voxy commands recorded so far are spliced
@@ -51,7 +58,8 @@ final class VkGpuTiming {
     private float totalMax;
     private int frames;
     private long windowStart;
-    private String shown = "GpuTime: [waiting]";
+    private List<String> shown = List.of("GpuTime: waiting");
+    private Boolean appleGpu;
 
     VkGpuTiming() {
         for (int i = 0; i < SLOTS; i++) {
@@ -69,7 +77,7 @@ final class VkGpuTiming {
         }
         if (enabled && !this.wasEnabled) {
             this.resetWindow(new String[0]);
-            this.shown = "GpuTime: [waiting]";
+            this.shown = List.of("GpuTime: waiting");
         }
         this.wasEnabled = enabled;
         if (!enabled) return;
@@ -174,17 +182,29 @@ final class VkGpuTiming {
         this.frames = 0;
     }
 
-    private String format() {
-        var str = new StringBuilder("GpuTime: [");
-        for (int i = 0; i < this.labels.length; i++) {
-            if (i != 0) str.append(", ");
-            str.append(this.labels[i]).append(':').append(String.format(Locale.ROOT, "%.2f", this.sums[i] / this.frames));
+    private static final int LINE_CHARS = 80;//fits F3's left column beside the right one
+
+    private List<String> format() {
+        if (this.appleGpu == null) {
+            this.appleGpu = "APPLE".equals(RenderSystem.getDevice().getDeviceInfo().vendorName());
         }
-        return str.append("] = ").append(String.format(Locale.ROOT, "%.2f", this.totalSum / this.frames))
-                .append(" ms, worst ").append(String.format(Locale.ROOT, "%.2f", this.totalMax)).toString();
+        var lines = new ArrayList<String>();
+        lines.add(String.format(Locale.ROOT, "GpuTime: %.2f ms, worst %.2f ms%s", this.totalSum / this.frames, this.totalMax,
+                this.appleGpu ? " (Apple GPU: per-pass split approximate)" : ""));
+        var line = new StringBuilder();
+        for (int i = 0; i < this.labels.length; i++) {
+            String entry = this.labels[i] + ":" + String.format(Locale.ROOT, "%.2f", this.sums[i] / this.frames);
+            if (line.length() != 0 && line.length() + 2 + entry.length() > LINE_CHARS) {
+                lines.add(line.toString());
+                line.setLength(0);
+            }
+            line.append(line.length() == 0 ? "  " : ", ").append(entry);
+        }
+        if (line.length() != 0) lines.add(line.toString());
+        return lines;
     }
 
-    String getDebug() {
+    List<String> getDebugLines() {
         return this.shown;
     }
 

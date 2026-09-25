@@ -14,6 +14,7 @@ import org.lwjgl.vulkan.VkSubmitInfo;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.List;
 
 import static me.cortex.voxy.client.core.vk.VkUtil.check;
 import static org.lwjgl.system.MemoryStack.stackPush;
@@ -356,9 +357,9 @@ public final class VkFrameCtx {
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     }
 
-    /** F3 line with the GPU time of each timed section (see gpuMarker). */
-    public String gpuTimingDebug() {
-        return this.gpuTiming.getDebug();
+    /** F3 lines with the frame's GPU time and each timed section's (see gpuMarker). */
+    public List<String> gpuTimingDebug() {
+        return this.gpuTiming.getDebugLines();
     }
 
     public void free() {
