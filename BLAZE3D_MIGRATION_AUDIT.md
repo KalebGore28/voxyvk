@@ -54,8 +54,8 @@ Work happens on the branch `blaze3d-migration`, off `vulkan-audit-fixes`. Sectio
 | 1.3 MC's destruction queue for deferred destroys (immediate during teardown) | Done, fine in normal play | `7a56ff41` |
 | 1.4 Allocations through MC's VMA | Done, fine in normal play | `e14ef866` |
 | Fix: LOD sections blanking while turning or leaving a spyglass (not a plan step) | Done, tested in-game (see below) | `110a6555`, `e0c6544d`, `719c29c1` |
-| 2.1 GPU timing on Blaze3D queries | Done, needs in-game testing | `6dac2b9b` |
-| 2.2 Name and limits from `DeviceInfo` | Done, needs in-game testing | `c09df914` |
+| 2.1 GPU timing on Blaze3D queries | Done, tested in-game (see below); F3 layout reworked in `1fb6a3a3` | `6dac2b9b` |
+| 2.2 Name and limits from `DeviceInfo` | Done, tested in-game | `c09df914` |
 | 2.3 follow-up: drop deferred VK renderer creation | Decided: keep it (see [2.3](#phase-2--small-pieces-onto-the-public-blaze3d-api-vk-first)) | |
 | 1.5 (optional) Samplers from Blaze3D | Not started; do it together with 3.1, which touches the atlas sampler anyway | |
 | Phase 3 onwards | Not started | |
@@ -79,6 +79,11 @@ Tested 2026-09-25 (jars `e14ef86` and `719c29c`, same setup):
 - FPS is somewhat lower than before, as expected: more geometry stays resident and gets drawn. See [Performance watch](#performance-watch).
 - Still not reported: the F3+T reload and the GL regression check.
 
+Tested 2026-09-25 (jar `c09df91`, M2 Max, 4112×2580 window, singleplayer and then a server):
+- 2.1: the `GpuTime` line works on MoltenVK. No errors across world join, leave, rejoin and settings rebuilds. On Apple GPUs the per-pass split is skewed; see [Performance watch](#performance-watch).
+- 2.2: the log reads *"vendor=APPLE, type=INTEGRATED, driver=1.2.334 MoltenVK 1.4.2"*.
+- The one-line F3 layout ran under the right column and hid the total. `1fb6a3a3` puts the total first and wraps the passes onto two more lines.
+
 What to watch for with 2.1 and 2.2:
 - **2.1:** set F3's `voxy:gpu_debug` entry to "In F3" (F3+F6 opens the debug options). About a second later F3 shows `GpuTime: [setup:…, bounds:…, RO:…, hiz:…, I:…, prep:…, OT:…, CG:…, TS:…, TP:…, ao:…, RT:…, comp:…, dyn:…] = total ms, worst …`. LODs must look the same with the line on and off, because the line splits Voxy's frame into one command buffer per section. If the log shows *"GPU timing marker inside a rendering instance"*, a marker sits inside a pass. On MoltenVK the times are approximate: Metal samples timestamps at encoder boundaries.
 - **2.2:** the log line *"Voxy Vulkan context adopted Minecraft device: … (vendor=…, type=…, driver=…"* names the vendor, device type and driver; everything else behaves as before.
@@ -92,8 +97,21 @@ What to watch for with 1.2–1.4:
 
 Performance is a co-priority of the migration: a step that makes the VK path slower needs a reason.
 - **Measure:**
-  - F3 `GpuTime` (2.1, with `voxy:gpu_debug`) gives the GPU time per pass.
+  - F3 `GpuTime` (2.1, with `voxy:gpu_debug`) gives the frame's GPU time and its split into passes.
+  - **On Apple GPUs only the total is reliable.** MoltenVK samples timestamps at Metal encoder boundaries, from an empty blit pass that waits on nothing. A timestamp after a draw pass is therefore taken while the draws still run, and their time lands in the next section that has to wait for them: RO → `hiz`/`I`, OT → `CG`, TP → `ao`, RT → `comp`. For per-pass costs on the Mac, use Xcode Instruments (Metal System Trace), or A/B one setting at a time against the total.
   - F3 `VK draws/budget (10s shortfalls)` (MoltenVK only) gives each terrain pass's real draw count, the budget it was drawn with, and how often the budget fell short.
+- **Baseline, 2026-09-25** (jar `c09df91`, M2 Max, 4112×2580 = 10.6 MP, MoltenVK 1.4.2):
+
+  | View | FPS (p50 / p98) | Voxy GPU total | Largest sections | Draws (real / budget) |
+  |---|---|---|---|---|
+  | Straight up at the sky, SSAO better (12 spp) | 120 / 120 (vsync) | ≈ 2.2 ms | `I` 1.09, `ao` 0.67, `hiz` 0.17 | O 0/1024, X 0/256 |
+  | Vista from y = 275 on a server, SSAO best (24 spp); 1,331 of 4,095 MB geometry, 98k nodes | 70 / 39 | ≈ 12.2 ms | `I` 8.02 (mostly the opaque draw), `ao` 2.26, `hiz` 0.93, `comp` 0.39, `CG` 0.35 | O 28,054/43,105, X 3,394/5,347 |
+
+  At 70 fps a frame lasts about 14 ms, so in the vista Voxy's GPU work is most of the frame: the game is GPU-bound there.
+- **Next measurements** (same spot, one change at a time, compare the total):
+  1. Shrink the window to about half width and height. If the total drops by half or more, per-pixel work (LOD fragments, SSAO, HiZ, composite) dominates; if it barely moves, per-draw and per-vertex work does.
+  2. SSAO `best` → `auto` (12 spp at this size) or `basic`.
+  3. `-Dvoxy.vk.drawBudgetGrowth=1.0` shows what the ~15k empty opaque draws cost (watch `short` for dropped sections).
 - **Known costs on MoltenVK (the M2 Max):**
   - MoltenVK has no indirect-count draws, so every budget slot is one Metal draw, empty ones included, encoded on the render thread inside MC's submit. The budget is the largest count of the last 8 s × 1.5 plus headroom (1024 opaque, 256 temporal/translucent). The × 1.5 predates the 8 s hold (`e0c6544d`) and could come down if `short` stays at 0.
   - Since `719c29c1` the geometry buffer is about 4 GiB instead of 2 GB, so more detail stays resident and is drawn. That costs frames, but it is what GL does too.
