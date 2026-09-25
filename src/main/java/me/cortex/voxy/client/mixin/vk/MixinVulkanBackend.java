@@ -26,7 +26,7 @@ public class MixinVulkanBackend {
     private static void voxy$requestDeviceFeatures(Collection<String> extensions, VulkanPhysicalDevice physicalDevice,
                                                    Set<VulkanFeature> features, CallbackInfoReturnable<VkDevice> cir) {
         try {
-            MinecraftVkHostAdapter.requestDeviceFeatures(physicalDevice.vkPhysicalDevice(), features);
+            MinecraftVkHostAdapter.requestDeviceFeatures(physicalDevice.vkPhysicalDevice(), extensions, features);
         } catch (Throwable t) {
             //Never break MC's device creation; Voxy's VK path will report the missing features
             Logger.warn("Voxy: failed to request Vulkan device features: " + t);

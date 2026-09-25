@@ -10,6 +10,8 @@ import com.mojang.blaze3d.vulkan.VulkanGpuTextureView;
 import com.mojang.blaze3d.vulkan.init.VulkanFeature;
 import me.cortex.voxy.client.mixin.vk.AccessorVulkanCommandEncoder;
 import org.lwjgl.system.MemoryStack;
+import org.lwjgl.vulkan.KHRDynamicRendering;
+import org.lwjgl.vulkan.KHRPushDescriptor;
 import org.lwjgl.vulkan.VK11;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkDevice;
@@ -20,6 +22,7 @@ import org.lwjgl.vulkan.VkPhysicalDeviceFeatures2;
 import org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features;
 import org.lwjgl.vulkan.VkQueue;
 
+import java.util.Collection;
 import java.util.Set;
 
 import static org.lwjgl.system.MemoryStack.stackPush;
@@ -83,15 +86,28 @@ public final class MinecraftVkHostAdapter implements IVkHost {
         this.device.createCommandEncoder().signalSemaphore(timelineSemaphore, value, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
     }
 
-    //Run by MixinVulkanBackend on MC's (mutable) enabled-feature set right before
-    // vkCreateDevice: appends every feature Voxy uses that the physical device supports,
-    // then records in VkDeviceFeatures what the device will have enabled.
-    public static void requestDeviceFeatures(VkPhysicalDevice physicalDevice, Set<VulkanFeature> enabledFeatures) {
+    //Run by MixinVulkanBackend on MC's device extensions and (mutable) enabled-feature set
+    // right before vkCreateDevice: appends every feature Voxy uses that the physical device
+    // supports, then records in VkDeviceFeatures what the device will have enabled.
+    public static void requestDeviceFeatures(VkPhysicalDevice physicalDevice, Collection<String> extensions,
+                                             Set<VulkanFeature> enabledFeatures) {
+        VkDeviceFeatures.recordHostFeatures(
+                extensions.contains(KHRPushDescriptor.VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME),
+                extensions.contains(KHRDynamicRendering.VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME)
+                        && isEnabled(enabledFeatures, "dynamicRendering"),
+                isEnabled(enabledFeatures, "timelineSemaphore"));
         VkDeviceFeatures.record(
                 enable(physicalDevice, enabledFeatures, SHADER_INT64),
                 enable(physicalDevice, enabledFeatures, FRAGMENT_STORES),
                 enable(physicalDevice, enabledFeatures, FIRST_INSTANCE),
                 enable(physicalDevice, enabledFeatures, DRAW_INDIRECT_COUNT));
+    }
+
+    private static boolean isEnabled(Set<VulkanFeature> enabledFeatures, String name) {
+        for (var feature : enabledFeatures) {
+            if (feature.name().equals(name)) return true;
+        }
+        return false;
     }
 
     private static boolean enable(VkPhysicalDevice physicalDevice, Set<VulkanFeature> enabledFeatures, VulkanFeature feature) {

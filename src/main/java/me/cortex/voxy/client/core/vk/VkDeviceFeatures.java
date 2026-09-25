@@ -15,6 +15,12 @@ import java.util.ArrayList;
 // here, and VulkanContext gates every code path on that.
 public final class VkDeviceFeatures {
     private static volatile boolean requested;
+    //Enabled by MC for itself and used by Voxy without enabling them (contract D5 on
+    // IVkHost): checked so that a Minecraft update dropping one reports Voxy unsupported
+    // instead of failing mid-frame
+    private static volatile boolean pushDescriptor;//VK_KHR_push_descriptor: every Voxy pipeline binds through it
+    private static volatile boolean dynamicRendering;//every Voxy render pass
+    private static volatile boolean timelineSemaphore;//VkFrameCtx's frame-retirement semaphore
     //Required: the terrain vertex shader uses 64-bit quads
     private static volatile boolean shaderInt64;
     //Required: the raster-cull fragment shader writes the visibility SSBO
@@ -23,6 +29,13 @@ public final class VkDeviceFeatures {
     private static volatile boolean firstInstance;
     //Optional: GPU-sourced draw counts (MoltenVK lacks it; a fixed-count path exists)
     private static volatile boolean drawIndirectCount;
+
+    //Called by MinecraftVkHostAdapter.requestDeviceFeatures, before record().
+    public static void recordHostFeatures(boolean pushDescriptor, boolean dynamicRendering, boolean timelineSemaphore) {
+        VkDeviceFeatures.pushDescriptor = pushDescriptor;
+        VkDeviceFeatures.dynamicRendering = dynamicRendering;
+        VkDeviceFeatures.timelineSemaphore = timelineSemaphore;
+    }
 
     //Called by MinecraftVkHostAdapter.requestDeviceFeatures, before vkCreateDevice.
     public static void record(boolean shaderInt64, boolean fragmentStores, boolean firstInstance, boolean drawIndirectCount) {
@@ -43,6 +56,9 @@ public final class VkDeviceFeatures {
             return "feature request hook did not run (MixinVulkanBackend)";
         }
         var missing = new ArrayList<String>();
+        if (!pushDescriptor) missing.add("VK_KHR_push_descriptor");
+        if (!dynamicRendering) missing.add("dynamicRendering");
+        if (!timelineSemaphore) missing.add("timelineSemaphore");
         if (!shaderInt64) missing.add("shaderInt64");
         if (!fragmentStores) missing.add("fragmentStoresAndAtomics");
         if (!firstInstance) missing.add("drawIndirectFirstInstance");
