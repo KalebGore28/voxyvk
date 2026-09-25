@@ -30,8 +30,8 @@ import org.lwjgl.vulkan.VkQueue;
  *      spliced into MC's submission there (VkFrameCtx.endFrame)
  *  D4  MC submits once per frame, at the end of Minecraft.renderFrame, with at most
  *      two submissions in flight
- *  D5  MC enables push descriptors, dynamic rendering and timeline semaphores, which
- *      Voxy uses without enabling them (checked at device creation, VkDeviceFeatures)
+ *  D5  MC enables push descriptors and dynamic rendering, which Voxy uses without
+ *      enabling them (checked at device creation, VkDeviceFeatures)
  *  D6  MC only uses its graphics queue from the render thread (VkFrameCtx.flushImmediate
  *      submits to it directly)
  *  D7  Blaze3D pipelines render to D32_SFLOAT depth only
@@ -74,11 +74,4 @@ public interface IVkHost {
      * be inside a render pass.
      */
     void endSegment(VkCommandBuffer segment);
-
-    /**
-     * Appends a timeline-semaphore signal to MC's pending queue submission. MC ends
-     * its current command buffer first, so the signal fires only after everything
-     * recorded before this call has executed on the GPU (and only once MC submits).
-     */
-    void signalSemaphore(long timelineSemaphore, long value);
 }

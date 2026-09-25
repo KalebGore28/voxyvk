@@ -18,7 +18,7 @@ import static org.lwjgl.vulkan.VK10.*;
 //Pure-VK implementation of the streaming upload contract: a persistently
 // mapped host-visible staging buffer + vkCmdCopyBuffer batches recorded into
 // the current frame commands at commit(). Staging space is recycled when the
-// frame that consumed it retires (VkFrameCtx's timeline semaphore), mirroring
+// frame that consumed it retires (VkFrameCtx's per-frame fences), mirroring
 // the GL fence-per-frame model 1:1.
 public class VkUploadStream extends AbstractUploadStream {
     private final VkFrameCtx ctx;

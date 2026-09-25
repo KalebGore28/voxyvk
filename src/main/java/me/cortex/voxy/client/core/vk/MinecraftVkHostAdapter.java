@@ -27,7 +27,6 @@ import java.util.Set;
 import static me.cortex.voxy.client.core.vk.VkUtil.check;
 import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.VK10.vkEndCommandBuffer;
-import static org.lwjgl.vulkan.VK13.VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 
 //IVkHost backed by MC 26.2's live Blaze3D Vulkan device. The device-level
 // handles (instance/physical device/device/queue+family) are pulled directly
@@ -85,13 +84,6 @@ public final class MinecraftVkHostAdapter implements IVkHost {
         this.device.createCommandEncoder().execute(segment);
     }
 
-    @Override
-    public void signalSemaphore(long timelineSemaphore, long value) {
-        //Public Blaze3D API: ends MC's current command buffer and adds the signal to
-        // the pending submission (a later command buffer starts a new submit batch)
-        this.device.createCommandEncoder().signalSemaphore(timelineSemaphore, value, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
-    }
-
     //Run by MixinVulkanBackend on MC's device extensions and (mutable) enabled-feature set
     // right before vkCreateDevice: appends every feature Voxy uses that the physical device
     // supports, then records in VkDeviceFeatures what the device will have enabled.
@@ -100,8 +92,7 @@ public final class MinecraftVkHostAdapter implements IVkHost {
         VkDeviceFeatures.recordHostFeatures(
                 extensions.contains(KHRPushDescriptor.VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME),
                 extensions.contains(KHRDynamicRendering.VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME)
-                        && isEnabled(enabledFeatures, "dynamicRendering"),
-                isEnabled(enabledFeatures, "timelineSemaphore"));
+                        && isEnabled(enabledFeatures, "dynamicRendering"));
         VkDeviceFeatures.record(
                 enable(physicalDevice, enabledFeatures, SHADER_INT64),
                 enable(physicalDevice, enabledFeatures, FRAGMENT_STORES),

@@ -20,7 +20,6 @@ public final class VkDeviceFeatures {
     // instead of failing mid-frame
     private static volatile boolean pushDescriptor;//VK_KHR_push_descriptor: every Voxy pipeline binds through it
     private static volatile boolean dynamicRendering;//every Voxy render pass
-    private static volatile boolean timelineSemaphore;//VkFrameCtx's frame-retirement semaphore
     //Required: the terrain vertex shader uses 64-bit quads
     private static volatile boolean shaderInt64;
     //Required: the raster-cull fragment shader writes the visibility SSBO
@@ -31,10 +30,9 @@ public final class VkDeviceFeatures {
     private static volatile boolean drawIndirectCount;
 
     //Called by MinecraftVkHostAdapter.requestDeviceFeatures, before record().
-    public static void recordHostFeatures(boolean pushDescriptor, boolean dynamicRendering, boolean timelineSemaphore) {
+    public static void recordHostFeatures(boolean pushDescriptor, boolean dynamicRendering) {
         VkDeviceFeatures.pushDescriptor = pushDescriptor;
         VkDeviceFeatures.dynamicRendering = dynamicRendering;
-        VkDeviceFeatures.timelineSemaphore = timelineSemaphore;
     }
 
     //Called by MinecraftVkHostAdapter.requestDeviceFeatures, before vkCreateDevice.
@@ -58,7 +56,6 @@ public final class VkDeviceFeatures {
         var missing = new ArrayList<String>();
         if (!pushDescriptor) missing.add("VK_KHR_push_descriptor");
         if (!dynamicRendering) missing.add("dynamicRendering");
-        if (!timelineSemaphore) missing.add("timelineSemaphore");
         if (!shaderInt64) missing.add("shaderInt64");
         if (!fragmentStores) missing.add("fragmentStoresAndAtomics");
         if (!firstInstance) missing.add("drawIndirectFirstInstance");

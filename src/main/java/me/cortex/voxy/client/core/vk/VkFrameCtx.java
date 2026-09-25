@@ -1,5 +1,7 @@
 package me.cortex.voxy.client.core.vk;
 
+import com.mojang.blaze3d.buffers.GpuFence;
+import com.mojang.blaze3d.systems.RenderSystem;
 import me.cortex.voxy.common.Logger;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VkCommandBuffer;
@@ -8,10 +10,9 @@ import org.lwjgl.vulkan.VkCommandBufferBeginInfo;
 import org.lwjgl.vulkan.VkFenceCreateInfo;
 import org.lwjgl.vulkan.VkMemoryBarrier;
 import org.lwjgl.vulkan.VkRenderingInfoKHR;
-import org.lwjgl.vulkan.VkSemaphoreCreateInfo;
-import org.lwjgl.vulkan.VkSemaphoreTypeCreateInfo;
 import org.lwjgl.vulkan.VkSubmitInfo;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 
 import static me.cortex.voxy.client.core.vk.VkUtil.check;
@@ -19,8 +20,6 @@ import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.KHRDynamicRendering.vkCmdBeginRenderingKHR;
 import static org.lwjgl.vulkan.KHRDynamicRendering.vkCmdEndRenderingKHR;
 import static org.lwjgl.vulkan.VK10.*;
-import static org.lwjgl.vulkan.VK12.VK_SEMAPHORE_TYPE_TIMELINE;
-import static org.lwjgl.vulkan.VK12.vkGetSemaphoreCounterValue;
 
 //The per-frame Vulkan recording context for the pure-VK path.
 //
@@ -33,11 +32,11 @@ import static org.lwjgl.vulkan.VK12.vkGetSemaphoreCounterValue;
 //  - the current recording target (cmd()), either the frame's command buffer
 //    (inside the render hook) or a one-shot immediate buffer (resource
 //    construction outside a frame);
-//  - frame completion tracking: each Voxy frame ends by asking MC's encoder
-//    (public Blaze3D API) to signal Voxy's timeline semaphore with the frame's
-//    index. The counter can only reach that value once MC has submitted the frame
-//    AND the GPU has executed it, so frames retire by reading the counter. Upload /
-//    download streams and deferred destruction retire on it;
+//  - frame completion tracking: each Voxy frame ends by creating a GpuFence (public
+//    Blaze3D API) on the MC submission it was spliced into. The fence can only
+//    complete once MC has submitted the frame AND the GPU has executed it, and
+//    submissions complete in order, so frames retire oldest first as their fences
+//    complete. Upload / download streams and deferred destruction retire on it;
 //  - deferred destruction of buffers/images/pipelines still referenced by frames
 //    in flight;
 //  - two invariants MC's command stream relies on: MC ends every operation with a
@@ -56,20 +55,20 @@ public final class VkFrameCtx {
     private final VulkanContext ctx;
     private final IVkHost host;
     private final Thread ownerThread;
-    private final long timeline;           //timeline semaphore, signalled with each frame's index
     private VkCommandBuffer frameCmd;      //the frame's command buffer while inside the hook
     private VkCommandBuffer immediateCmd;  //one-shot fallback outside the hook
     private boolean anyWorkThisFrame;
     private boolean renderingActive;       //a vkCmdBeginRenderingKHR without its end has been recorded
 
-    //Frame indices start at 1 so the timeline's initial value (0) means "nothing completed"
+    //Frame indices start at 1 so 0 means "nothing completed"
     private long frameCounter = 1;         //index of the frame currently being recorded
-    private long lastSignaled = 0;         //highest frame index whose signal was handed to MC
     private long retiredCounter = 0;       //all frames <= this have completed on the GPU
+    private final ArrayDeque<FrameFence> inFlight = new ArrayDeque<>();//oldest first
 
     private final ArrayList<PendingDestroy> pendingDestroys = new ArrayList<>();
     private final ArrayList<FrameRetireListener> retireListeners = new ArrayList<>();
 
+    private record FrameFence(long frameIdx, GpuFence fence) {}
     private record PendingDestroy(long frameIdx, long buffer, long image, long imageView, long memory,
                                   long pipeline, long pipelineLayout) {}
 
@@ -77,15 +76,6 @@ public final class VkFrameCtx {
         this.ctx = ctx;
         this.host = host;
         this.ownerThread = Thread.currentThread();
-        try (MemoryStack stack = stackPush()) {
-            var type = VkSemaphoreTypeCreateInfo.calloc(stack).sType$Default()
-                    .semaphoreType(VK_SEMAPHORE_TYPE_TIMELINE)
-                    .initialValue(0);
-            var sci = VkSemaphoreCreateInfo.calloc(stack).sType$Default().pNext(type.address());
-            var pSemaphore = stack.mallocLong(1);
-            check(vkCreateSemaphore(ctx.device, sci, null, pSemaphore), "vkCreateSemaphore(timeline)");
-            this.timeline = pSemaphore.get(0);
-        }
     }
 
     public VulkanContext vk() {
@@ -135,10 +125,9 @@ public final class VkFrameCtx {
             this.host.endSegment(cmd);
         }
         if (this.anyWorkThisFrame) {
-            //Queued after the spliced frame: fires once everything recorded so far (MC's
-            // work and Voxy's frame) has executed
-            this.host.signalSemaphore(this.timeline, this.frameCounter);
-            this.lastSignaled = this.frameCounter;
+            //On the MC submission the frame was just spliced into: completes once that
+            // submission (MC's work and Voxy's frame) has executed
+            this.inFlight.add(new FrameFence(this.frameCounter, RenderSystem.getDevice().createCommandEncoder().createFence()));
             this.frameCounter++;
             this.anyWorkThisFrame = false;
         }
@@ -212,19 +201,24 @@ public final class VkFrameCtx {
     //==================================================================================
     // Frame retirement
 
-    private long completedFrame() {
-        try (MemoryStack stack = stackPush()) {
-            var pValue = stack.mallocLong(1);
-            check(vkGetSemaphoreCounterValue(this.ctx.device, this.timeline, pValue), "vkGetSemaphoreCounterValue");
-            return pValue.get(0);
+    //Advances retiredCounter past every frame whose fence has completed; true if it moved.
+    // awaitCompletion(0) only polls: a frame whose MC submission has not been submitted
+    // yet reports incomplete rather than blocking.
+    private boolean retireCompletedFrames() {
+        long retired = this.retiredCounter;
+        while (!this.inFlight.isEmpty() && this.inFlight.peek().fence.awaitCompletion(0)) {
+            var frame = this.inFlight.poll();
+            frame.fence.close();
+            retired = frame.frameIdx;
         }
+        if (retired == this.retiredCounter) return false;
+        this.retiredCounter = retired;
+        return true;
     }
 
     /** Retire every frame the GPU has finished (recycles staging space, fires readbacks, runs destroys). */
     public void pollRetired() {
-        long completed = this.completedFrame();
-        if (completed > this.retiredCounter) {
-            this.retiredCounter = completed;
+        if (this.retireCompletedFrames()) {
             this.runRetirement();
         }
     }
@@ -237,7 +231,7 @@ public final class VkFrameCtx {
     public void waitIdleRetireAll() {
         this.flushImmediate();
         vkDeviceWaitIdle(this.ctx.device);
-        this.retiredCounter = Math.max(this.retiredCounter, this.completedFrame());
+        this.retireCompletedFrames();
         //Always run: callers (e.g. download flushWaitClear) may have just queued work
         // tagged with an already-completed frame and expect it retired now
         this.runRetirement();
@@ -322,18 +316,19 @@ public final class VkFrameCtx {
 
     public void free() {
         this.waitIdleRetireAll();
-        if (this.frameCmd == null && this.completedFrame() >= this.lastSignaled) {
+        if (this.frameCmd == null && this.inFlight.isEmpty()) {
             //Everything Voxy recorded has executed and nothing is being recorded, so
             // objects freed since the last frame (tagged with the upcoming index) are
-            // unused too: retire everything, then drop the semaphore
+            // unused too: retire everything
             this.retiredCounter = Long.MAX_VALUE;
             this.runRetirement();
-            vkDestroySemaphore(this.ctx.device, this.timeline, null);
         } else {
-            //A frame whose signal MC has not submitted yet still references Voxy's
-            // objects (and the semaphore): leaking them is the only safe option
+            //A frame MC has not submitted yet still references Voxy's objects: leaking
+            // them is the only safe option
             Logger.error("VkFrameCtx freed while a recorded frame is unsubmitted; leaking "
-                    + this.pendingDestroys.size() + " pending destroys and the timeline semaphore");
+                    + this.pendingDestroys.size() + " pending destroys");
+            this.inFlight.forEach(frame -> frame.fence.close());
+            this.inFlight.clear();
         }
     }
 }
