@@ -18,6 +18,7 @@ and this project uses versioning in the format `MAJOR.MINOR.PATCH+mcVERSION`.
 
 ### Fixed
 - Vulkan on macOS: turning toward terrain that was visible a few seconds earlier, or leaving a spyglass after a short zoom, no longer drops random LOD sections for a few frames. Without GPU-sourced draw counts (MoltenVK), the per-frame draw budget was based on a count read back 2-3 frames late, so a sudden jump in visible sections skipped the excess draws. It now covers the largest count of the last 8 seconds. The F3 screen shows each pass's draw count, its budget, and any shortfalls in the last 10 seconds
+- Vulkan: in large LOD worlds, terrain that had just left the screen no longer has to reload (blank for up to a second or two) when you turn back to it or leave a spyglass. The geometry buffer was a flat 2 GB, so it stayed full and the cleaner kept evicting whatever was off screen. It is now sized like the OpenGL path: up to 4 GiB, limited by the device memory still available minus 1.5 GiB, and `-Dvoxy.geometryBufferSizeOverrideMB` works on Vulkan too
 
 ## [0.2.21+mc26.2] - 2026-09-25
 

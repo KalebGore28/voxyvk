@@ -2,12 +2,14 @@ package me.cortex.voxy.client.core.vk;
 
 import me.cortex.voxy.common.Logger;
 import org.lwjgl.system.MemoryStack;
+import org.lwjgl.util.vma.VmaBudget;
 import org.lwjgl.vulkan.VkCommandPoolCreateInfo;
 import org.lwjgl.vulkan.VkDevice;
 import org.lwjgl.vulkan.VkFormatProperties;
 import org.lwjgl.vulkan.VkInstance;
 import org.lwjgl.vulkan.VkPhysicalDevice;
 import org.lwjgl.vulkan.VkPhysicalDeviceMaintenance3Properties;
+import org.lwjgl.vulkan.VkPhysicalDeviceMemoryProperties;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
 import org.lwjgl.vulkan.VkPhysicalDeviceSubgroupProperties;
 import org.lwjgl.vulkan.VkPipelineCacheCreateInfo;
@@ -20,6 +22,7 @@ import java.util.function.LongSupplier;
 
 import static me.cortex.voxy.client.core.vk.VkUtil.check;
 import static org.lwjgl.system.MemoryStack.stackPush;
+import static org.lwjgl.util.vma.Vma.vmaGetHeapBudgets;
 import static org.lwjgl.vulkan.VK10.*;
 import static org.lwjgl.vulkan.VK11.*;
 
@@ -158,6 +161,34 @@ public final class VulkanContext {
     /** minUniformBufferOffsetAlignment of the physical device. */
     public long uniformBufferOffsetAlignment() {
         return this.uniformAlign;
+    }
+
+    /**
+     * Estimated device-local memory still available: the budget of the largest
+     * device-local heap minus what MC's VMA allocator (MC's and Voxy's allocations) has
+     * taken from it. MC does not enable VK_EXT_memory_budget, so VMA budgets 80% of the
+     * heap and cannot see other processes: an upper estimate, like the GL path's
+     * free-memory query. -1 if the device reports no device-local heap.
+     */
+    public long deviceLocalBytesAvailable() {
+        try (MemoryStack stack = stackPush()) {
+            var props = VkPhysicalDeviceMemoryProperties.malloc(stack);
+            vkGetPhysicalDeviceMemoryProperties(this.physicalDevice, props);
+            int heap = -1;
+            long heapSize = 0;
+            for (int i = 0; i < props.memoryHeapCount(); i++) {
+                var memoryHeap = props.memoryHeaps(i);
+                if ((memoryHeap.flags() & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0 && memoryHeap.size() > heapSize) {
+                    heap = i;
+                    heapSize = memoryHeap.size();
+                }
+            }
+            if (heap < 0) return -1;
+            var budgets = VmaBudget.malloc(VK_MAX_MEMORY_HEAPS, stack);
+            vmaGetHeapBudgets(this.vma, budgets);
+            var budget = budgets.get(heap);
+            return budget.budget() - budget.usage();
+        }
     }
 
     /** Shared clamp-to-edge sampler (nearest or linear, optional nearest mip), cached for the device lifetime. */

@@ -176,11 +176,25 @@ public class VkRenderCore {
     }
 
     private static long geometryCapacity(VulkanContext vctx) {
-        //Conservative fixed allocation (no sparse residency tricks on VK): 2GB, halved
-        // on allocation failure inside VkSectionGeometryData. It is bound as ONE storage
-        // buffer and is ONE allocation, so it must also fit maxStorageBufferRange (the
-        // spec only guarantees 128 MiB) and maxMemoryAllocationSize.
-        long capacity = Math.min(2048L << 20, Math.min(vctx.maxStorageBufferRange, vctx.maxMemoryAllocationSize));
+        //Same policy as the GL path (RenderResourceReuse.getGeometryBufferSize): up to
+        // 4 GiB, at least 512 MiB, and no more than the device can spare minus 1.5 GiB.
+        // A flat 2 GB kept the buffer full on large LOD worlds: the cleaner then evicted
+        // whatever had just left the screen, so turning back (or leaving a spyglass)
+        // reloaded it, with holes for seconds.
+        long capacity = (1L << 32) - 1024;
+        long available = vctx.deviceLocalBytesAvailable();
+        if (available >= 0) {
+            capacity = Math.min(capacity, Math.max(512L << 20, available - (1536L << 20)));
+        }
+        String override = System.getProperty("voxy.geometryBufferSizeOverrideMB", "");
+        if (!override.isEmpty()) {
+            capacity = Long.parseLong(override) << 20;
+        }
+        //No sparse residency tricks on VK: it is bound as ONE storage buffer and is ONE
+        // allocation, so it must also fit maxStorageBufferRange (the spec only guarantees
+        // 128 MiB) and maxMemoryAllocationSize. VkSectionGeometryData halves it on
+        // allocation failure.
+        capacity = Math.min(capacity, Math.min(vctx.maxStorageBufferRange, vctx.maxMemoryAllocationSize));
         return capacity & ~7L;//VkSectionGeometryData requires a multiple of 8
     }
 
