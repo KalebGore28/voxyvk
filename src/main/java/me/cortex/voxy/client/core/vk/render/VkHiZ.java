@@ -5,6 +5,7 @@ import me.cortex.voxy.client.core.vk.VkFrameCtx;
 import me.cortex.voxy.client.core.vk.VkImage2D;
 import me.cortex.voxy.client.core.vk.VkShaderPipeline;
 import me.cortex.voxy.client.core.vk.VkShaderSource;
+import me.cortex.voxy.common.Logger;
 import org.lwjgl.system.MemoryStack;
 
 import java.util.List;
@@ -45,7 +46,13 @@ public class VkHiZ {
         //Built when compute shaders support clustered subgroup ops (the shader uses
         // subgroupClustered*, so ARITHMETIC alone is not enough); used per frame only
         // when the pyramid is big enough (see buildMipChain).
-        if (ctx.vk().supportsSubgroupHiZ()) {
+        //-Dvoxy.vk.disableSubgroupHiZ=true forces the per-level path: on MoltenVK the
+        // clustered ops are emulated, and a wrong pyramid shows up as LODs wrongly culled.
+        boolean subgroupDisabled = Boolean.getBoolean("voxy.vk.disableSubgroupHiZ");
+        if (subgroupDisabled) {
+            Logger.info("Voxy VK: subgroup HiZ reduction disabled (voxy.vk.disableSubgroupHiZ), using the per-level reduction");
+        }
+        if (ctx.vk().supportsSubgroupHiZ() && !subgroupDisabled) {
             this.subgroupReduce = new VkShaderPipeline(ctx, "hiz_subgroup.comp",
                     VkShaderSource.load("voxy:hiz/vk/hiz_subgroup.comp", VkShaderSource.defs().props(properties).build()),
                     16,
