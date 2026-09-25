@@ -58,7 +58,7 @@ Work happens on the branch `blaze3d-migration`, off `vulkan-audit-fixes`. Everyt
 | 2.1 GPU timing on Blaze3D queries | Done, tested in-game (see below); F3 layout reworked in `1fb6a3a3` | `6dac2b9b` |
 | 2.2 Name and limits from `DeviceInfo` | Done, tested in-game | `c09df914` |
 | 2.3 follow-up: drop deferred VK renderer creation | Decided: keep it (see [2.3](#phase-2--small-pieces-onto-the-public-blaze3d-api-vk-first)) | |
-| 4.1 Chunk-bounds pass on Blaze3D (with 3.2 for the depth-bound target) | Done, needs in-game testing (0.2.23) | `9a06f6d2` |
+| 4.1 Chunk-bounds pass on Blaze3D (with 3.2 for the depth-bound target) | Done, tested in-game (0.2.23) | `9a06f6d2` |
 | 1.5 (optional) Samplers from Blaze3D | Not started; do it together with 3.1, which touches the atlas sampler anyway | |
 | 3.1, 3.2 for the other targets, 4.2, Phase 5 | Not started | |
 
@@ -87,6 +87,8 @@ Tested 2026-09-25 (jar `c09df91`, M2 Max, 4112×2580 window, singleplayer and th
 - The one-line F3 layout ran under the right column and hid the total. `1fb6a3a3` puts the total first and wraps the passes onto two more lines.
 
 Tested 2026-09-25 (jar `e299f3c`): an F3+T reload on the server rebuilt the renderer. LODs streamed back in with correct block textures, so the async atlas readback (2.3) holds up after a reload too. While everything reloads, the temporal pass shows a few shortfalls (`T short 8`): freshly loaded sections are all "new", but nothing was on screen there yet. GL regression checks can't run on the M2 Max (Voxy's GL path needs OpenGL 4.6; macOS stops at 4.1), so shared-code changes rely on compiling and review unless a Windows/Linux machine is available.
+
+Tested 2026-09-25 (jar `6907a8e`, M2 Max): 4.1 works in-game; LODs look as before. A thin seam line over water is pre-existing: upstream Voxy shows it too, so it isn't a migration regression.
 
 What to watch for with 4.1 (jar `0.2.23+mc26.2`):
 - The log must not show *"Couldn't compile pipeline voxy:pipeline/chunk_bounds"* (Minecraft) or *"the chunk-bounds pipeline failed to compile"* (Voxy), nor *"Voxy VK frame failed"*.
