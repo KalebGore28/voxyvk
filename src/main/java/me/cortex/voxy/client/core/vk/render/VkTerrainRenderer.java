@@ -606,6 +606,7 @@ public class VkTerrainRenderer {
 
         //Resolve everything that can throw BEFORE opening the rendering instance
         long lightmapView = VkFrameHost.lightmapView();
+        long depthBoundView = VkFrameHost.vkView(viewport.depthBoundView);
         this.beginRendering(viewport, colorView, !clear);//LOAD unless first pass (which cleared via compositor setup)
         pipeline.bind(cmd);
         VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
@@ -618,7 +619,8 @@ public class VkTerrainRenderer {
                     .sampler(8, this.modelStore.atlas.view, this.modelStore.atlasSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
                     //MC's lightmap is an MC-owned image: always in MC_IMAGE_LAYOUT
                     .sampler(9, lightmapView, this.lightmapSampler, VkFrameHost.MC_IMAGE_LAYOUT)
-                    .sampler(10, viewport.depthBoundSampleView, this.depthBoundSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                    //Blaze3D texture (Blaze3DBoundRenderer): always in MC_IMAGE_LAYOUT too
+                    .sampler(10, depthBoundView, this.depthBoundSampler, VkFrameHost.MC_IMAGE_LAYOUT)
                     .push(cmd);
         }
         vkCmdBindIndexBuffer(cmd, this.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT16);

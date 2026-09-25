@@ -15,6 +15,7 @@ import me.cortex.voxy.client.core.rendering.bounding.StreamedBoundStore;
 import me.cortex.voxy.client.core.rendering.hierachical.AsyncNodeManager;
 import me.cortex.voxy.client.core.rendering.util.AbstractDownloadStream;
 import me.cortex.voxy.client.core.rendering.util.AbstractUploadStream;
+import me.cortex.voxy.client.core.rendering.util.IDeviceBuffer;
 import me.cortex.voxy.client.core.vk.MinecraftVkHost;
 import me.cortex.voxy.client.core.vk.VkBuffer;
 import me.cortex.voxy.client.core.vk.VkDownloadStream;
@@ -59,7 +60,7 @@ public class VkRenderCore {
     private final VkTerrainRenderer terrainRenderer;
     private final VkCompositor compositor;
     private final VkSSAO ssao;
-    private final VkBoundRenderer boundRenderer;
+    private final Blaze3DBoundRenderer boundRenderer;
     private final StreamedBoundStore visibleSectionStream;
     private boolean shutDown = false;
     private final RenderDistanceTracker renderDistanceTracker;
@@ -128,12 +129,22 @@ public class VkRenderCore {
             this.ssao = new VkSSAO(this.frameCtx, this.uploadStream, this.properties, VoxyConfig.CONFIG.getSSAOMode());
             undo.push(this.ssao::free);
             //Depth-bound culling: Sodium's visibility mixins feed the store; the bound
-            // renderer rasters visible-chunk AABBs into the depth-bound image so the
-            // terrain shaders can discard LOD fragments vanilla terrain will cover.
-            this.visibleSectionStream = new StreamedBoundStore(
-                    size -> new VkBuffer(this.frameCtx, size));
+            // renderer rasters visible-chunk AABBs into the depth-bound target so the
+            // terrain shaders can discard LOD fragments vanilla terrain will cover. It
+            // uploads the store's CPU-side positions itself each frame, so the store's own
+            // device buffer is a placeholder that is never written.
+            this.visibleSectionStream = new StreamedBoundStore(size -> new IDeviceBuffer() {
+                @Override
+                public long sizeBytes() {
+                    return size;
+                }
+
+                @Override
+                public void free() {
+                }
+            });
             undo.push(this.visibleSectionStream::free);
-            this.boundRenderer = new VkBoundRenderer(this.frameCtx, this.uploadStream, this.properties);
+            this.boundRenderer = new Blaze3DBoundRenderer(this.frameCtx, this.properties);
             undo.push(this.boundRenderer::free);
 
             world.setDirtyCallback(this.nodeManager::worldEvent);
@@ -243,25 +254,28 @@ public class VkRenderCore {
             //gpuMarker opens a section of F3's GpuTime line (only while voxy:gpu_debug is
             // showing). Labels shared with GL's GPUTiming mean the same pass; GL counts the
             // HiZ in "I".
+
+            //1. raster the vanilla-visible chunk bounds into the depth-bound target (sampled
+            // by the terrain draws below to cull LOD fragments behind vanilla). A Blaze3D
+            // pass, recorded into MC's command stream: first, while nothing is recorded in
+            // Voxy's frame yet, so it lands before Voxy's command buffer without a split
+            this.frameCtx.gpuMarker("bounds");
+            this.boundRenderer.render(viewport, this.visibleSectionStream);
+
             this.frameCtx.gpuMarker("setup");
             viewport.ensureTargets();
 
             var rt = new VkCompositor.VkViewportRT(viewport,
                     target.getColorTextureView(), target.getDepthTextureView(), target.width, target.height);
 
-            //1. copy MC depth in + stencil mask (also clears the offscreen targets)
+            //2. copy MC depth in + stencil mask (also clears the offscreen targets)
             this.compositor.setupDepthStencil(rt);
 
-            //1.5 raster the vanilla-visible chunk bounds into the depth-bound image
-            // (sampled by the terrain draws below to cull LOD fragments behind vanilla)
-            this.frameCtx.gpuMarker("bounds");
-            this.boundRenderer.render(viewport, this.visibleSectionStream);
-
-            //2. opaque LOD terrain (draw calls generated LAST frame)
+            //3. opaque LOD terrain (draw calls generated LAST frame)
             this.frameCtx.gpuMarker("RO");
             this.terrainRenderer.renderOpaque(viewport, false);
 
-            //3. HiZ + node management + hierarchical traversal
+            //4. HiZ + node management + hierarchical traversal
             this.frameCtx.gpuMarker("hiz");
             this.compositor.offscreenToSampled(viewport);
             viewport.hiZ.buildMipChain(viewport.depthSampleView, viewport.width, viewport.height);
@@ -273,11 +287,11 @@ public class VkRenderCore {
             this.nodeCleaner.tick(this.traversal.getNodeBuffer());
             this.traversal.doTraversal(viewport);
 
-            //4. build the draw commands for this frame (prep, raster cull, cmdgen, translucency sort)
+            //5. build the draw commands for this frame (prep, raster cull, cmdgen, translucency sort)
             this.frameCtx.gpuMarker("prep");
             this.terrainRenderer.buildDrawCalls(viewport);
 
-            //5. temporal, then SSAO (reads colour+depth, writes colourSSAO with
+            //6. temporal, then SSAO (reads colour+depth, writes colourSSAO with
             // sanitized alpha), then translucents onto the SSAO output — the same
             // opaque->temporal->SSAO->translucent order as the GL pipeline
             this.frameCtx.gpuMarker("TP");
@@ -287,12 +301,12 @@ public class VkRenderCore {
             this.frameCtx.gpuMarker("RT");
             this.terrainRenderer.renderTranslucent(viewport);
 
-            //6. composite into MC's frame
+            //7. composite into MC's frame
             this.frameCtx.gpuMarker("comp");
             this.compositor.offscreenToSampled(viewport);
             this.compositor.composite(rt);
 
-            //7. dynamic CPU work (uploads recycled, model baking, render distance tracking)
+            //8. dynamic CPU work (uploads recycled, model baking, render distance tracking)
             this.frameCtx.gpuMarker("dyn");
             this.uploadStream.tick();
             this.renderDistanceTracker.setCenterAndProcess(viewport.cameraX, viewport.cameraZ);

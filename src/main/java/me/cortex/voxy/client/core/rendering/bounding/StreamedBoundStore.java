@@ -66,4 +66,9 @@ public final class StreamedBoundStore implements IBoundStore {
     public int getCount() {
         return this.count>>1;
     }
+
+    /** The visible section positions, packed as two ints each ({@link #getCount()} of them), for a backend that uploads them itself. */
+    public int[] packedPositions() {
+        return this.visibleSections;
+    }
 }

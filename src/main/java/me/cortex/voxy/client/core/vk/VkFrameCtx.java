@@ -28,10 +28,11 @@ import static org.lwjgl.vulkan.VK10.*;
 // per-submit pool, which endFrame splices into MC's frame submission right after
 // what MC recorded before the render hook (VulkanCommandEncoder.execute, through
 // IVkHost). Inside it: upload copies -> compute -> raster passes -> draws ->
-// readback copies, ordered with pipeline barriers. While F3's GPU timing is on, the
-// frame is split into several such buffers, one per timed section (gpuMarker).
-// Pipeline barriers order everything earlier in submission order, so the split
-// changes nothing for synchronization. This class owns:
+// readback copies, ordered with pipeline barriers. Blaze3D work inside the frame
+// (blaze3d(), e.g. the chunk-bounds pass) and F3's GPU timing (gpuMarker) split it into
+// several such buffers, because Blaze3D records into MC's command stream. Pipeline
+// barriers order everything earlier in submission order, so a split changes nothing
+// for Voxy's own synchronization. This class owns:
 //
 //  - the current recording target (cmd()), either the frame's command buffer
 //    (inside the render hook) or a one-shot immediate buffer (resource
@@ -125,11 +126,35 @@ public final class VkFrameCtx {
             this.gpuTiming.mark(label);
             return;
         }
+        this.splitSegment(() -> this.gpuTiming.mark(label));
+    }
+
+    /**
+     * Runs Blaze3D encoder work (a render pass, a copy) at this point of the frame. Blaze3D
+     * records into MC's command stream, never into Voxy's command buffer. While nothing has
+     * been recorded into the current one, MC's current buffer already precedes it, and the
+     * work runs as is. Otherwise what the frame recorded so far is spliced in first, ending
+     * with the full barrier MC's operations rely on (contract D2), and a new command buffer
+     * begins after it. Never inside a rendering instance; fetch cmd() again afterwards.
+     */
+    public void blaze3d(Runnable work) {
+        if (this.frameCmd == null || !this.segmentUsed) {
+            work.run();
+            return;
+        }
+        if (this.renderingActive) throw new IllegalStateException("Blaze3D work inside a rendering instance");
+        this.fullBarrier();
+        this.splitSegment(work);
+    }
+
+    //Splices the frame's command buffer into MC's submission, runs `between` (Blaze3D
+    // calls, which land in MC's next buffer), and begins a new command buffer after it
+    private void splitSegment(Runnable between) {
         var cmd = this.frameCmd;
         this.frameCmd = null;
         this.host.endSegment(cmd);
         try {
-            this.gpuTiming.mark(label);
+            between.run();
         } finally {
             this.frameCmd = this.host.beginSegment();
             this.segmentUsed = false;
