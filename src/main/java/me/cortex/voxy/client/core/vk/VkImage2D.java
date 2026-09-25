@@ -1,25 +1,25 @@
 package me.cortex.voxy.client.core.vk;
 
 import org.lwjgl.system.MemoryStack;
+import org.lwjgl.util.vma.VmaAllocationCreateInfo;
 import org.lwjgl.vulkan.VkImageCreateInfo;
 import org.lwjgl.vulkan.VkImageMemoryBarrier;
 import org.lwjgl.vulkan.VkImageViewCreateInfo;
-import org.lwjgl.vulkan.VkMemoryAllocateInfo;
-import org.lwjgl.vulkan.VkMemoryRequirements;
 
 import static me.cortex.voxy.client.core.vk.VkUtil.check;
 import static org.lwjgl.system.MemoryStack.stackPush;
+import static org.lwjgl.util.vma.Vma.*;
 import static org.lwjgl.vulkan.VK10.*;
 
 //2D image + full view (+ optional per-mip views) for the pure-VK path:
 // offscreen colour/depth targets, the HiZ mip pyramid, and the model atlas.
-// Tracks the current layout for whole-image transitions (Voxy transitions
-// whole subresource ranges only, keeping parity with the GL path's coarse
-// barrier usage).
+// Device-local memory from MC's VMA allocator. Tracks the current layout for
+// whole-image transitions (Voxy transitions whole subresource ranges only,
+// keeping parity with the GL path's coarse barrier usage).
 public final class VkImage2D {
     private final VkFrameCtx ctx;
     public final long image;
-    public final long memory;
+    private final long allocation;//VmaAllocation
     public final long view;
     public final long[] mipViews;//null unless requested
     public final int width, height, mipLevels;
@@ -51,22 +51,16 @@ public final class VkImage2D {
                     .usage(usage)
                     .sharingMode(VK_SHARING_MODE_EXCLUSIVE)
                     .initialLayout(VK_IMAGE_LAYOUT_UNDEFINED);
+            var aci = VmaAllocationCreateInfo.calloc(stack)
+                    .usage(VMA_MEMORY_USAGE_UNKNOWN)
+                    .requiredFlags(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             var pImg = stack.mallocLong(1);
-            check(vkCreateImage(vctx.device, ici, null, pImg), "vkCreateImage");
+            var pAllocation = stack.mallocPointer(1);
+            check(vmaCreateImage(vctx.vma, ici, aci, pImg, pAllocation, null), "vmaCreateImage");
             long image = pImg.get(0);
-            long memory = VK_NULL_HANDLE;
+            long allocation = pAllocation.get(0);
             var views = new java.util.ArrayList<Long>();
             try {
-                var req = VkMemoryRequirements.calloc(stack);
-                vkGetImageMemoryRequirements(vctx.device, image, req);
-                var mai = VkMemoryAllocateInfo.calloc(stack).sType$Default()
-                        .allocationSize(req.size())
-                        .memoryTypeIndex(vctx.findMemoryType(req.memoryTypeBits(), VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
-                var pMem = stack.mallocLong(1);
-                check(vkAllocateMemory(vctx.device, mai, null, pMem), "vkAllocateMemory(image)");
-                memory = pMem.get(0);
-                check(vkBindImageMemory(vctx.device, image, memory, 0), "vkBindImageMemory");
-
                 views.add(createView(stack, vctx, image, format, aspect, 0, mipLevels));
                 if (perMipViews) {
                     for (int i = 0; i < mipLevels; i++) {
@@ -75,12 +69,11 @@ public final class VkImage2D {
                 }
             } catch (RuntimeException e) {
                 for (long v : views) vkDestroyImageView(vctx.device, v, null);
-                if (memory != VK_NULL_HANDLE) vkFreeMemory(vctx.device, memory, null);
-                vkDestroyImage(vctx.device, image, null);
+                vmaDestroyImage(vctx.vma, image, allocation);
                 throw e;
             }
             this.image = image;
-            this.memory = memory;
+            this.allocation = allocation;
             this.view = views.get(0);
             if (perMipViews) {
                 this.mipViews = new long[mipLevels];
@@ -160,7 +153,8 @@ public final class VkImage2D {
 
     public void free() {
         var device = this.ctx.vk().device;
-        long image = this.image, view = this.view, memory = this.memory;
+        long vma = this.ctx.vk().vma;
+        long image = this.image, view = this.view, allocation = this.allocation;
         long[] mipViews = this.mipViews;
         long[] extraViews = this.extraViews.stream().mapToLong(Long::longValue).toArray();
         this.ctx.deferDestroy(() -> {
@@ -169,8 +163,7 @@ public final class VkImage2D {
             }
             for (long v : extraViews) vkDestroyImageView(device, v, null);
             vkDestroyImageView(device, view, null);
-            vkDestroyImage(device, image, null);
-            vkFreeMemory(device, memory, null);
+            vmaDestroyImage(vma, image, allocation);
         });
     }
 

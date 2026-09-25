@@ -4,19 +4,20 @@ import me.cortex.voxy.client.core.rendering.IRenderList;
 import me.cortex.voxy.client.core.rendering.util.IDeviceBuffer;
 import me.cortex.voxy.common.util.TrackedObject;
 import org.lwjgl.system.MemoryStack;
+import org.lwjgl.util.vma.VmaAllocationCreateInfo;
+import org.lwjgl.util.vma.VmaAllocationInfo;
 import org.lwjgl.vulkan.VkBufferCreateInfo;
-import org.lwjgl.vulkan.VkMemoryAllocateInfo;
-import org.lwjgl.vulkan.VkMemoryRequirements;
 
 import static me.cortex.voxy.client.core.vk.VkUtil.check;
 import static org.lwjgl.system.MemoryStack.stackPush;
-import static org.lwjgl.system.MemoryUtil.NULL;
+import static org.lwjgl.util.vma.Vma.*;
 import static org.lwjgl.vulkan.VK10.*;
 
 //Device buffer on the pure-Vulkan path; the VK analogue of GlBuffer. All Voxy
 // buffers get a superset of usage flags (storage/indirect/index/transfer) so a
-// single class covers every role the GL path used raw buffer ids for. Memory is
-// a dedicated device-local allocation (Voxy has few, large, long-lived buffers).
+// single class covers every role the GL path used raw buffer ids for. Memory
+// comes from MC's VMA allocator: small buffers share its memory blocks, large
+// ones get dedicated allocations.
 //
 //Freeing is DEFERRED through VkFrameCtx — a buffer may still be referenced by
 // command buffers in flight when free() is called.
@@ -30,7 +31,8 @@ public class VkBuffer extends TrackedObject implements IDeviceBuffer, IRenderLis
 
     private final VkFrameCtx ctx;
     public final long buffer;
-    public final long memory;
+    private final long allocation;//VmaAllocation
+    private final long mappedPtr;//persistent mapping of host-visible buffers, else 0
     private final long size;
 
     private static int COUNT;
@@ -47,7 +49,9 @@ public class VkBuffer extends TrackedObject implements IDeviceBuffer, IRenderLis
     }
 
     //requiredMemory must all be present on the chosen memory type; preferredMemory is
-    // used when some type also has it (e.g. HOST_CACHED for CPU readback buffers)
+    // used when some type also has it (e.g. HOST_CACHED for CPU readback buffers).
+    // VMA picks the type from exactly these flags (no usage preset), as the manual
+    // memory-type search did before.
     public VkBuffer(VkFrameCtx ctx, long size, int usage, int requiredMemory, int preferredMemory) {
         this.ctx = ctx;
         this.size = size;
@@ -55,43 +59,31 @@ public class VkBuffer extends TrackedObject implements IDeviceBuffer, IRenderLis
         try (MemoryStack stack = stackPush()) {
             var bci = VkBufferCreateInfo.calloc(stack).sType$Default()
                     .size(size).usage(usage).sharingMode(VK_SHARING_MODE_EXCLUSIVE);
-            var pBuf = stack.mallocLong(1);
-            check(vkCreateBuffer(vctx.device, bci, null, pBuf), "vkCreateBuffer");
-            long buffer = pBuf.get(0);
-            long memory = VK_NULL_HANDLE;
-            try {
-                var req = VkMemoryRequirements.calloc(stack);
-                vkGetBufferMemoryRequirements(vctx.device, buffer, req);
-                int memoryType = vctx.findMemoryType(req.memoryTypeBits(), requiredMemory, preferredMemory);
-                if (memoryType < 0) throw new IllegalStateException("No suitable VK memory type");
-                var mai = VkMemoryAllocateInfo.calloc(stack).sType$Default()
-                        .allocationSize(req.size())
-                        .memoryTypeIndex(memoryType);
-                var pMem = stack.mallocLong(1);
-                check(vkAllocateMemory(vctx.device, mai, null, pMem), "vkAllocateMemory");
-                memory = pMem.get(0);
-                check(vkBindBufferMemory(vctx.device, buffer, memory, 0), "vkBindBufferMemory");
-            } catch (RuntimeException e) {
-                //Allocation can legitimately fail (VkSectionGeometryData retries smaller);
-                // don't leak the buffer handle each time
-                if (memory != VK_NULL_HANDLE) vkFreeMemory(vctx.device, memory, null);
-                vkDestroyBuffer(vctx.device, buffer, null);
-                throw e;
+            var aci = VmaAllocationCreateInfo.calloc(stack)
+                    .usage(VMA_MEMORY_USAGE_UNKNOWN)
+                    .requiredFlags(requiredMemory)
+                    .preferredFlags(preferredMemory);
+            if ((requiredMemory & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+                aci.flags(VMA_ALLOCATION_CREATE_MAPPED_BIT);//persistently mapped, see map()
             }
-            this.buffer = buffer;
-            this.memory = memory;
+            var pBuffer = stack.mallocLong(1);
+            var pAllocation = stack.mallocPointer(1);
+            var info = VmaAllocationInfo.calloc(stack);
+            //Allocation can legitimately fail (VkSectionGeometryData retries smaller);
+            // VMA creates nothing then, so there is nothing to clean up
+            check(vmaCreateBuffer(vctx.vma, bci, aci, pBuffer, pAllocation, info), "vmaCreateBuffer");
+            this.buffer = pBuffer.get(0);
+            this.allocation = pAllocation.get(0);
+            this.mappedPtr = info.pMappedData();
         }
         COUNT++;
         TOTAL_SIZE += size;
     }
 
-    /** Maps the whole buffer; only valid for hostVisible buffers. */
+    /** Address of the whole buffer's persistent mapping; only valid for hostVisible buffers. */
     public long map() {
-        try (MemoryStack stack = stackPush()) {
-            var pp = stack.mallocPointer(1);
-            check(vkMapMemory(this.ctx.vk().device, this.memory, 0, this.size, 0, pp), "vkMapMemory");
-            return pp.get(0);
-        }
+        if (this.mappedPtr == 0) throw new IllegalStateException("VkBuffer is not host visible");
+        return this.mappedPtr;
     }
 
     @Override
@@ -128,12 +120,9 @@ public class VkBuffer extends TrackedObject implements IDeviceBuffer, IRenderLis
         this.free0();
         COUNT--;
         TOTAL_SIZE -= this.size;
-        var device = this.ctx.vk().device;
-        long buffer = this.buffer, memory = this.memory;
-        this.ctx.deferDestroy(() -> {
-            vkDestroyBuffer(device, buffer, null);
-            vkFreeMemory(device, memory, null);
-        });
+        long vma = this.ctx.vk().vma;
+        long buffer = this.buffer, allocation = this.allocation;
+        this.ctx.deferDestroy(() -> vmaDestroyBuffer(vma, buffer, allocation));
     }
 
     public static int getCount() {

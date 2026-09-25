@@ -8,7 +8,6 @@ import org.lwjgl.vulkan.VkFormatProperties;
 import org.lwjgl.vulkan.VkInstance;
 import org.lwjgl.vulkan.VkPhysicalDevice;
 import org.lwjgl.vulkan.VkPhysicalDeviceMaintenance3Properties;
-import org.lwjgl.vulkan.VkPhysicalDeviceMemoryProperties;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
 import org.lwjgl.vulkan.VkPhysicalDeviceSubgroupProperties;
 import org.lwjgl.vulkan.VkPipelineCacheCreateInfo;
@@ -26,9 +25,10 @@ import static org.lwjgl.vulkan.VK11.*;
 
 //Wraps the Vulkan device Voxy renders on. Voxy never creates its own device:
 // when MC 26.2 runs on its native Vulkan backend, Voxy ADOPTS the game's
-// VkInstance/VkDevice/queue via IVkHost. MC owns (and destroys) the device and
-// instance; destroy() tears down only the objects Voxy created on it (command pool,
-// pipeline cache, and the device-lifetime sampler / descriptor-set-layout caches).
+// VkInstance/VkDevice/queue and its VMA allocator via IVkHost. MC owns (and
+// destroys) the device, instance and allocator; destroy() tears down only the
+// objects Voxy created on it (command pool, pipeline cache, and the device-lifetime
+// sampler / descriptor-set-layout caches).
 //
 //Capabilities are what the ADOPTED device can legally use: device features come
 // from what MC actually enabled (VkDeviceFeatures, fed by MixinVulkanBackend), not
@@ -39,6 +39,7 @@ public final class VulkanContext {
     public final VkDevice device;
     public final VkQueue queue;
     public final int queueFamily;
+    public final long vma;//MC's VmaAllocator, which Voxy's buffers and images are allocated from
     public final boolean hasDrawIndirectCount;//drawIndirectCount ENABLED on MC's device
     public final boolean subgroupArithmetic;//basic + arithmetic subgroup ops usable in compute shaders
     public final boolean subgroupClustered;//... plus clustered ops
@@ -65,6 +66,7 @@ public final class VulkanContext {
         this.device = host.device();
         this.queue = host.graphicsQueue();
         this.queueFamily = host.graphicsQueueFamily();
+        this.vma = host.vma();
 
         String missing = VkDeviceFeatures.missingRequired();
         if (missing != null) {
@@ -158,34 +160,6 @@ public final class VulkanContext {
         return this.uniformAlign;
     }
 
-    //Device memory properties are immutable for the device lifetime; cache them
-    // instead of re-querying the driver per allocation. Freed in destroy().
-    private VkPhysicalDeviceMemoryProperties memoryProperties;
-    public int findMemoryType(int typeBits, int required) {
-        int type = this.findMemoryType(typeBits, required, 0);
-        if (type < 0) throw new IllegalStateException("No suitable VK memory type");
-        return type;
-    }
-
-    /** Type with all {@code required} (and ideally all {@code preferred}) flags, or -1. */
-    public synchronized int findMemoryType(int typeBits, int required, int preferred) {
-        if (this.memoryProperties == null) {
-            this.memoryProperties = VkPhysicalDeviceMemoryProperties.malloc();
-            vkGetPhysicalDeviceMemoryProperties(this.physicalDevice, this.memoryProperties);
-        }
-        var mem = this.memoryProperties;
-        if (preferred != 0) {
-            int wanted = required | preferred;
-            for (int i = 0; i < mem.memoryTypeCount(); i++) {
-                if ((typeBits & (1 << i)) != 0 && (mem.memoryTypes(i).propertyFlags() & wanted) == wanted) return i;
-            }
-        }
-        for (int i = 0; i < mem.memoryTypeCount(); i++) {
-            if ((typeBits & (1 << i)) != 0 && (mem.memoryTypes(i).propertyFlags() & required) == required) return i;
-        }
-        return -1;
-    }
-
     /** Shared clamp-to-edge sampler (nearest or linear, optional nearest mip), cached for the device lifetime. */
     public synchronized long sampler(boolean mipmapNearest, boolean linear) {
         int key = (mipmapNearest ? 1 : 0) | (linear ? 2 : 0);
@@ -229,10 +203,6 @@ public final class VulkanContext {
         this.descriptorSetLayouts.clear();
         vkDestroyPipelineCache(this.device, this.pipelineCache, null);
         vkDestroyCommandPool(this.device, this.commandPool, null);
-        if (this.memoryProperties != null) {
-            this.memoryProperties.free();
-            this.memoryProperties = null;
-        }
-        //Host mode: MC owns the device/instance; only the objects above were ours.
+        //Host mode: MC owns the device/instance/allocator; only the objects above were ours.
     }
 }

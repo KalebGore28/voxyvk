@@ -52,6 +52,9 @@ public interface IVkHost {
     VkQueue graphicsQueue();
     int graphicsQueueFamily();
 
+    /** MC's VMA allocator (VmaAllocator handle); Voxy allocates its buffers and images from it. */
+    long vma();
+
     /** VkImage behind one of MC's textures (MC keeps it in VkFrameHost.MC_IMAGE_LAYOUT). */
     long vkImage(GpuTexture texture);
 

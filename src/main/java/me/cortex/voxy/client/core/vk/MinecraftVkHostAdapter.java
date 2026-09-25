@@ -65,6 +65,7 @@ public final class MinecraftVkHostAdapter implements IVkHost {
     @Override public VkDevice device() { return this.device.vkDevice(); }
     @Override public VkQueue graphicsQueue() { return this.device.graphicsQueue().vkQueue(); }
     @Override public int graphicsQueueFamily() { return this.device.graphicsQueue().queueFamilyIndex(); }
+    @Override public long vma() { return this.device.vma(); }
 
     @Override public long vkImage(GpuTexture texture) { return ((VulkanGpuTexture) texture).vkImage(); }
     @Override public long vkImageView(GpuTextureView view) { return ((VulkanGpuTextureView) view).vkImageView(); }
