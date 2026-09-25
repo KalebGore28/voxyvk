@@ -122,8 +122,11 @@ public abstract class VoxyInstance {
         }
         if (world == null) {//If the cached world is null, try get from the active worlds
             long stamp = this.activeWorldLock.readLock();
-            world = this.activeWorlds.get(identifier);
-            this.activeWorldLock.unlockRead(stamp);
+            try {
+                world = this.activeWorlds.get(identifier);
+            } finally {
+                this.activeWorldLock.unlockRead(stamp);
+            }
             if (world != null) {//Setup cache
                 identifier.cachedEngineObject = new WeakReference<>(world);
             }
@@ -204,27 +207,33 @@ public abstract class VoxyInstance {
         List<WorldIdentifier> idleWorlds = null;
         {
             long stamp = this.activeWorldLock.readLock();
-            for (var pair : this.activeWorlds.entrySet()) {
-                if (pair.getValue().isWorldIdle()) {
-                    if (idleWorlds == null) idleWorlds = new ArrayList<>();
-                    idleWorlds.add(pair.getKey());
+            try {
+                for (var pair : this.activeWorlds.entrySet()) {
+                    if (pair.getValue().isWorldIdle()) {
+                        if (idleWorlds == null) idleWorlds = new ArrayList<>();
+                        idleWorlds.add(pair.getKey());
+                    }
                 }
+            } finally {
+                this.activeWorldLock.unlockRead(stamp);
             }
-            this.activeWorldLock.unlockRead(stamp);
         }
 
         if (idleWorlds != null) {
             //Shutdown and clear all idle worlds
             long stamp = this.activeWorldLock.writeLock();
-            for (var id : idleWorlds) {
-                var world = this.activeWorlds.remove(id);
-                if (world == null) continue;//Race condition between unlock read and acquire write
-                if (!world.isWorldIdle()) {this.activeWorlds.put(id, world); continue;}//No longer idle
-                Logger.info("Shutting down idle world: " + id.getLongHash());
-                //If is here close and free the world
-                world.free();
+            try {
+                for (var id : idleWorlds) {
+                    var world = this.activeWorlds.remove(id);
+                    if (world == null) continue;//Race condition between unlock read and acquire write
+                    if (!world.isWorldIdle()) {this.activeWorlds.put(id, world); continue;}//No longer idle
+                    Logger.info("Shutting down idle world: " + id.getLongHash());
+                    //If is here close and free the world
+                    world.free();
+                }
+            } finally {
+                this.activeWorldLock.unlockWrite(stamp);
             }
-            this.activeWorldLock.unlockWrite(stamp);
         }
     }
 
@@ -246,10 +255,13 @@ public abstract class VoxyInstance {
 
         if (!this.activeWorlds.isEmpty()) {
             long stamp = this.activeWorldLock.readLock();
-            for (var world : this.activeWorlds.values()) {
-                this.importManager.cancelImport(world);
+            try {
+                for (var world : this.activeWorlds.values()) {
+                    this.importManager.cancelImport(world);
+                }
+            } finally {
+                this.activeWorldLock.unlockRead(stamp);
             }
-            this.activeWorldLock.unlockRead(stamp);
         }
 
         try {this.ingestService.shutdown();} catch (Exception e) {Logger.error(e);}
@@ -257,40 +269,43 @@ public abstract class VoxyInstance {
 
 
         long stamp = this.activeWorldLock.writeLock();
-
-        if (!this.activeWorlds.isEmpty()) {
-            boolean printedNotice = false;
-            for (var world : new ArrayList<>(this.activeWorlds.values())) {
-                if (world.isWorldUsed()) {
-                    if (!printedNotice) {
-                        printedNotice = true;
-                        Logger.error("Not all worlds shutdown, force closing worlds");
-                    }
-                    //Dont lock in the loopy thing, this should basicly never happen if it does something horrific happened
-                    this.activeWorldLock.unlockWrite(stamp);
-                    while (world.isWorldUsed()) {
-                        try {
-                            //noinspection BusyWait
-                            Thread.sleep(10);
-                        } catch (InterruptedException e) {
-                            throw new RuntimeException(e);
+        try {
+            if (!this.activeWorlds.isEmpty()) {
+                boolean printedNotice = false;
+                for (var world : new ArrayList<>(this.activeWorlds.values())) {
+                    if (world.isWorldUsed()) {
+                        if (!printedNotice) {
+                            printedNotice = true;
+                            Logger.error("Not all worlds shutdown, force closing worlds");
                         }
+                        //Dont lock in the loopy thing, this should basicly never happen if it does something horrific happened
+                        this.activeWorldLock.unlockWrite(stamp);
+                        stamp = 0;//Not held while waiting (write stamps are never 0), so the finally skips the unlock
+                        while (world.isWorldUsed()) {
+                            try {
+                                //noinspection BusyWait
+                                Thread.sleep(10);
+                            } catch (InterruptedException e) {
+                                throw new RuntimeException(e);
+                            }
+                        }
+                        stamp = this.activeWorldLock.writeLock();
                     }
-                    stamp = this.activeWorldLock.writeLock();
+                    //Free the world
+                    world.free();
                 }
-                //Free the world
-                world.free();
+                this.activeWorlds.clear();
             }
-            this.activeWorlds.clear();
-        }
 
-        try {this.threadPool.shutdown();} catch (Exception e) {Logger.error(e);}
+            try {this.threadPool.shutdown();} catch (Exception e) {Logger.error(e);}
 
-        if (!this.activeWorlds.isEmpty()) {
-            throw new IllegalStateException("Not all worlds shutdown");
+            if (!this.activeWorlds.isEmpty()) {
+                throw new IllegalStateException("Not all worlds shutdown");
+            }
+            Logger.info("Instance shutdown");
+        } finally {
+            if (stamp != 0) this.activeWorldLock.unlockWrite(stamp);
         }
-        Logger.info("Instance shutdown");
-        this.activeWorldLock.unlockWrite(stamp);
     }
 
     public boolean isIngestEnabled(WorldIdentifier worldId) {
