@@ -54,6 +54,7 @@ Work happens on the branch `blaze3d-migration`, off `vulkan-audit-fixes`. Sectio
 | 1.3 MC's destruction queue for deferred destroys (immediate during teardown) | Done, fine in normal play | `7a56ff41` |
 | 1.4 Allocations through MC's VMA | Done, fine in normal play | `e14ef866` |
 | Fix: LOD sections blanking while turning or leaving a spyglass (not a plan step) | Done, tested in-game (see below) | `110a6555`, `e0c6544d`, `719c29c1` |
+| Perf: MoltenVK draw budgets sized by view direction and FOV (not a plan step) | Done, tested in-game; see [Performance watch](#performance-watch) | `cff6763e`, `e299f3c9` |
 | 2.1 GPU timing on Blaze3D queries | Done, tested in-game (see below); F3 layout reworked in `1fb6a3a3` | `6dac2b9b` |
 | 2.2 Name and limits from `DeviceInfo` | Done, tested in-game | `c09df914` |
 | 2.3 follow-up: drop deferred VK renderer creation | Decided: keep it (see [2.3](#phase-2--small-pieces-onto-the-public-blaze3d-api-vk-first)) | |
@@ -114,7 +115,11 @@ Performance is a co-priority of the migration: a step that makes the VK path slo
 
   The second row exposed the 8 s any-direction hold of `e0c6544d`. After a quick turn the temporal pass had briefly drawn about 42k sections, and every pass then kept its peak: 176k Metal draws per frame, 133k of them empty. `ao` rose although SSAO's samples were halved, because on Apple GPUs it also absorbs the temporal pass, here 63,745 empty draws. That puts an empty draw's GPU cost somewhere around 20–25 ns, before MoltenVK's CPU encoding. `cff6763e` sizes the budgets by view direction; a simulation of the same view gives 47k opaque slots instead of 99k.
 
+  | Same spot and view, SSAO auto; 3,460 MB geometry, 275k nodes (jar `e299f3c`) | 69 / 56 | 11.1 ms | `I` 8.55, `ao` 1.23, `comp` 0.45, `CG` 0.36, `hiz` 0.24 | O 31,937/40,945, T 0/256, X 4,372/5,721, no shortfalls |
+
   The third row confirms it: `ao` halved (2.71 → 1.35 ms) once the temporal pass lost its 63k empty draws, so those cost about 1.3 ms of GPU per frame. But the temporal pass then fell short on nearly every spyglass exit: each step of an FOV change re-picks the LOD of the whole view, not just the widening edges. The opaque budget also kept zoomed-in counts for the normal view. `e299f3c9` makes the budgets FOV-aware (see Known costs above). A frame-by-frame simulation of MC's FOV easing gives no shortfalls on spyglass exits, quick turns or pans.
+
+  The fourth row is the result. With about the same real draw count as the third, the budgets fell from 73k to 41k opaque slots. The GPU total dropped 6 ms, and FPS went from 41 to 69 (p98 from 21 to 56). In-game (2026-09-25), panning and spyglass use show no holes. Spam-clicking the spyglass, or a hitch, can still blank LODs for a moment; the user judged that acceptable for expected use.
 - **Next measurements** (same spot, one change at a time, compare the total):
   1. Shrink the window to about half width and height. If the total drops by half or more, per-pixel work (LOD fragments, SSAO, HiZ, composite) dominates; if it barely moves, per-draw and per-vertex work does.
   2. SSAO `best` → `auto` (12 spp at this size) or `basic`.
