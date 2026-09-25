@@ -85,6 +85,8 @@ Tested 2026-09-25 (jar `c09df91`, M2 Max, 4112×2580 window, singleplayer and th
 - 2.2: the log reads *"vendor=APPLE, type=INTEGRATED, driver=1.2.334 MoltenVK 1.4.2"*.
 - The one-line F3 layout ran under the right column and hid the total. `1fb6a3a3` puts the total first and wraps the passes onto two more lines.
 
+Tested 2026-09-25 (jar `e299f3c`): an F3+T reload on the server rebuilt the renderer. LODs streamed back in with correct block textures, so the async atlas readback (2.3) holds up after a reload too. While everything reloads, the temporal pass shows a few shortfalls (`T short 8`): freshly loaded sections are all "new", but nothing was on screen there yet. GL regression checks can't run on the M2 Max (Voxy's GL path needs OpenGL 4.6; macOS stops at 4.1), so shared-code changes rely on compiling and review unless a Windows/Linux machine is available.
+
 What to watch for with 2.1 and 2.2:
 - **2.1:** set F3's `voxy:gpu_debug` entry to "In F3" (F3+F6 opens the debug options). About a second later F3 shows `GpuTime: [setup:…, bounds:…, RO:…, hiz:…, I:…, prep:…, OT:…, CG:…, TS:…, TP:…, ao:…, RT:…, comp:…, dyn:…] = total ms, worst …`. LODs must look the same with the line on and off, because the line splits Voxy's frame into one command buffer per section. If the log shows *"GPU timing marker inside a rendering instance"*, a marker sits inside a pass. On MoltenVK the times are approximate: Metal samples timestamps at encoder boundaries.
 - **2.2:** the log line *"Voxy Vulkan context adopted Minecraft device: … (vendor=…, type=…, driver=…"* names the vendor, device type and driver; everything else behaves as before.
