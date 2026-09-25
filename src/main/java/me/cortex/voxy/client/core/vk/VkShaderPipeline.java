@@ -19,28 +19,30 @@ import static org.lwjgl.vulkan.VK10.*;
 // always present on an adopted device), an optional push-constant range, and
 // either a compute stage or a vert+frag pair with dynamic rendering.
 //
-//Binding numbers mirror the (possibly remapped) layout(binding=N) declarations
-// of the VK shader variants; see assets/voxy/shaders/lod/vk/.
+//Binding numbers mirror the layout(binding=N) declarations in the shared shader
+// sources (VK-specific numbering lives in their #ifdef VOXY_VULKAN branches or is
+// injected as defines by the Java side).
 public final class VkShaderPipeline {
     public static final int T_UBO = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     public static final int T_SSBO = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     public static final int T_SAMPLER = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     public static final int T_IMAGE = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 
-    //Interned descriptorSetLayout cache keyed by (device, binding-hash) so
-    // pipelines sharing a binding table reuse one layout handle (and skip
-    // re-creating + later destroying it). Lives for the device lifetime.
-    private static final java.util.Map<Long, java.util.Map<Long, Long>> LAYOUT_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
-
     private final VkFrameCtx ctx;
     public final long descriptorSetLayout;
     public final long pipelineLayout;
     public final long pipeline;
-    private final long[] modules;
     private final boolean compute;
     private final int pushStages;
+    private boolean freed;
 
     public record Binding(int binding, int type) {}
+
+    //Descriptor set layouts are interned per device (VulkanContext) by their FULL
+    // binding table: pipelines with identical tables share one handle. (Keying by a
+    // hash of the table, as before, could hand back a layout with the wrong
+    // descriptor types on a collision.)
+    private record LayoutKey(int stages, List<Binding> bindings) {}
 
     public static Binding ubo(int b) { return new Binding(b, T_UBO); }
     public static Binding ssbo(int b) { return new Binding(b, T_SSBO); }
@@ -56,15 +58,23 @@ public final class VkShaderPipeline {
         var vctx = ctx.vk();
         try (MemoryStack stack = stackPush()) {
             long module = createModule(vctx, ShadercCompiler.compile(computeGlsl, ShaderType.COMPUTE, name), stack);
-            this.modules = new long[]{module};
-            this.descriptorSetLayout = createSetLayout(vctx, stack, bindings, VK_SHADER_STAGE_COMPUTE_BIT);
-            this.pipelineLayout = createPipelineLayout(vctx, stack, this.descriptorSetLayout, pushConstantBytes, VK_SHADER_STAGE_COMPUTE_BIT);
+            try {
+                this.descriptorSetLayout = createSetLayout(vctx, bindings, VK_SHADER_STAGE_COMPUTE_BIT);
+                this.pipelineLayout = createPipelineLayout(vctx, stack, this.descriptorSetLayout, pushConstantBytes, VK_SHADER_STAGE_COMPUTE_BIT);
 
-            var cpci = VkComputePipelineCreateInfo.calloc(1, stack).sType$Default().layout(this.pipelineLayout);
-            cpci.stage().sType$Default().stage(VK_SHADER_STAGE_COMPUTE_BIT).module(module).pName(stack.UTF8("main"));
-            var pPipe = stack.mallocLong(1);
-            check(vkCreateComputePipelines(vctx.device, VK_NULL_HANDLE, cpci, null, pPipe), "vkCreateComputePipelines(" + name + ")");
-            this.pipeline = pPipe.get(0);
+                var cpci = VkComputePipelineCreateInfo.calloc(1, stack).sType$Default().layout(this.pipelineLayout);
+                cpci.stage().sType$Default().stage(VK_SHADER_STAGE_COMPUTE_BIT).module(module).pName(stack.UTF8("main"));
+                var pPipe = stack.mallocLong(1);
+                int result = vkCreateComputePipelines(vctx.device, vctx.pipelineCache, cpci, null, pPipe);
+                if (result != VK_SUCCESS) {
+                    vkDestroyPipelineLayout(vctx.device, this.pipelineLayout, null);
+                    check(result, "vkCreateComputePipelines(" + name + ")");
+                }
+                this.pipeline = pPipe.get(0);
+            } finally {
+                //A module is only needed while pipelines are created from it
+                vkDestroyShaderModule(vctx.device, module, null);
+            }
         }
     }
 
@@ -103,86 +113,101 @@ public final class VkShaderPipeline {
         var vctx = ctx.vk();
         try (MemoryStack stack = stackPush()) {
             long vertModule = createModule(vctx, ShadercCompiler.compile(d.vertGlsl, ShaderType.VERTEX, d.name + ".vert"), stack);
-            long fragModule = createModule(vctx, ShadercCompiler.compile(d.fragGlsl, ShaderType.FRAGMENT, d.name + ".frag"), stack);
-            this.modules = new long[]{vertModule, fragModule};
-            this.descriptorSetLayout = createSetLayout(vctx, stack, d.bindings, this.pushStages);
-            this.pipelineLayout = createPipelineLayout(vctx, stack, this.descriptorSetLayout, d.pushConstantBytes, this.pushStages);
+            long fragModule;
+            try {
+                fragModule = createModule(vctx, ShadercCompiler.compile(d.fragGlsl, ShaderType.FRAGMENT, d.name + ".frag"), stack);
+            } catch (RuntimeException e) {
+                vkDestroyShaderModule(vctx.device, vertModule, null);
+                throw e;
+            }
+            try {
+                this.descriptorSetLayout = createSetLayout(vctx, d.bindings, this.pushStages);
+                this.pipelineLayout = createPipelineLayout(vctx, stack, this.descriptorSetLayout, d.pushConstantBytes, this.pushStages);
 
-            var stages = VkPipelineShaderStageCreateInfo.calloc(2, stack);
-            stages.get(0).sType$Default().stage(VK_SHADER_STAGE_VERTEX_BIT).module(vertModule).pName(stack.UTF8("main"));
-            stages.get(1).sType$Default().stage(VK_SHADER_STAGE_FRAGMENT_BIT).module(fragModule).pName(stack.UTF8("main"));
+                var stages = VkPipelineShaderStageCreateInfo.calloc(2, stack);
+                stages.get(0).sType$Default().stage(VK_SHADER_STAGE_VERTEX_BIT).module(vertModule).pName(stack.UTF8("main"));
+                stages.get(1).sType$Default().stage(VK_SHADER_STAGE_FRAGMENT_BIT).module(fragModule).pName(stack.UTF8("main"));
 
-            var vertexInput = VkPipelineVertexInputStateCreateInfo.calloc(stack).sType$Default();//vertex pulling
-            //MoltenVK/Metal cannot disable primitive restart for strip/fan topologies (VK_ERROR_FEATURE_NOT_PRESENT),
-            //so enable it for those. It must stay VK_FALSE for list topologies (spec VUID-...-topology-06252 without
-            //primitiveTopologyListRestart). Restart has no effect on our non-indexed strip draws, so this is safe.
-            var inputAssembly = VkPipelineInputAssemblyStateCreateInfo.calloc(stack).sType$Default()
-                    .topology(d.topology)
-                    .primitiveRestartEnable(isStripTopology(d.topology));
-            //Dynamic viewport+scissor: one pipeline survives resizes
-            var dynamicState = VkPipelineDynamicStateCreateInfo.calloc(stack).sType$Default()
-                    .pDynamicStates(stack.ints(VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR));
-            var viewportState = VkPipelineViewportStateCreateInfo.calloc(stack).sType$Default()
-                    .viewportCount(1).scissorCount(1);
-            var raster = VkPipelineRasterizationStateCreateInfo.calloc(stack).sType$Default()
-                    .polygonMode(VK_POLYGON_MODE_FILL).cullMode(VK_CULL_MODE_NONE)//GL path disables cull face
-                    .frontFace(VK_FRONT_FACE_COUNTER_CLOCKWISE).lineWidth(1);
-            var msaa = VkPipelineMultisampleStateCreateInfo.calloc(stack).sType$Default()
-                    .rasterizationSamples(VK_SAMPLE_COUNT_1_BIT);
+                var vertexInput = VkPipelineVertexInputStateCreateInfo.calloc(stack).sType$Default();//vertex pulling
+                //MoltenVK/Metal cannot disable primitive restart for strip/fan topologies (VK_ERROR_FEATURE_NOT_PRESENT),
+                //so enable it for those. It must stay VK_FALSE for list topologies (spec VUID-...-topology-06252 without
+                //primitiveTopologyListRestart). Restart has no effect on our non-indexed strip draws, so this is safe.
+                var inputAssembly = VkPipelineInputAssemblyStateCreateInfo.calloc(stack).sType$Default()
+                        .topology(d.topology)
+                        .primitiveRestartEnable(isStripTopology(d.topology));
+                //Dynamic viewport+scissor: one pipeline survives resizes
+                var dynamicState = VkPipelineDynamicStateCreateInfo.calloc(stack).sType$Default()
+                        .pDynamicStates(stack.ints(VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR));
+                var viewportState = VkPipelineViewportStateCreateInfo.calloc(stack).sType$Default()
+                        .viewportCount(1).scissorCount(1);
+                var raster = VkPipelineRasterizationStateCreateInfo.calloc(stack).sType$Default()
+                        .polygonMode(VK_POLYGON_MODE_FILL).cullMode(VK_CULL_MODE_NONE)//GL path disables cull face
+                        .frontFace(VK_FRONT_FACE_COUNTER_CLOCKWISE).lineWidth(1);
+                var msaa = VkPipelineMultisampleStateCreateInfo.calloc(stack).sType$Default()
+                        .rasterizationSamples(VK_SAMPLE_COUNT_1_BIT);
 
-            var depthState = VkPipelineDepthStencilStateCreateInfo.calloc(stack).sType$Default()
-                    .depthTestEnable(d.depthTest).depthWriteEnable(d.depthWrite).depthCompareOp(d.depthCompare);
-            if (d.stencilTestEqual1 || d.stencilWriteAlways1) {
-                depthState.stencilTestEnable(true);
-                var op = depthState.front();
-                if (d.stencilWriteAlways1) {
-                    op.failOp(VK_STENCIL_OP_KEEP).passOp(VK_STENCIL_OP_REPLACE).depthFailOp(VK_STENCIL_OP_KEEP)
-                            .compareOp(VK_COMPARE_OP_ALWAYS).compareMask(0xFF).writeMask(0xFF).reference(d.stencilWriteRef);
-                } else {
-                    op.failOp(VK_STENCIL_OP_KEEP).passOp(VK_STENCIL_OP_KEEP).depthFailOp(VK_STENCIL_OP_KEEP)
-                            .compareOp(VK_COMPARE_OP_EQUAL).compareMask(0xFF).writeMask(0x00).reference(1);
+                var depthState = VkPipelineDepthStencilStateCreateInfo.calloc(stack).sType$Default()
+                        .depthTestEnable(d.depthTest).depthWriteEnable(d.depthWrite).depthCompareOp(d.depthCompare);
+                if (d.stencilTestEqual1 || d.stencilWriteAlways1) {
+                    depthState.stencilTestEnable(true);
+                    var op = depthState.front();
+                    if (d.stencilWriteAlways1) {
+                        op.failOp(VK_STENCIL_OP_KEEP).passOp(VK_STENCIL_OP_REPLACE).depthFailOp(VK_STENCIL_OP_KEEP)
+                                .compareOp(VK_COMPARE_OP_ALWAYS).compareMask(0xFF).writeMask(0xFF).reference(d.stencilWriteRef);
+                    } else {
+                        op.failOp(VK_STENCIL_OP_KEEP).passOp(VK_STENCIL_OP_KEEP).depthFailOp(VK_STENCIL_OP_KEEP)
+                                .compareOp(VK_COMPARE_OP_EQUAL).compareMask(0xFF).writeMask(0x00).reference(1);
+                    }
+                    depthState.back(depthState.front());
                 }
-                depthState.back(depthState.front());
-            }
 
-            var blendAttach = VkPipelineColorBlendAttachmentState.calloc(1, stack)
-                    .colorWriteMask(d.colorWrite ? 0xF : 0)
-                    .blendEnable(d.blend);
-            if (d.blend) {
-                blendAttach.srcColorBlendFactor(VK_BLEND_FACTOR_SRC_ALPHA)
-                        .dstColorBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
-                        .colorBlendOp(VK_BLEND_OP_ADD)
-                        .srcAlphaBlendFactor(VK_BLEND_FACTOR_ONE)
-                        .dstAlphaBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
-                        .alphaBlendOp(VK_BLEND_OP_ADD);
-            }
-            var blend = VkPipelineColorBlendStateCreateInfo.calloc(stack).sType$Default();
-            if (d.colorFormat != VK_FORMAT_UNDEFINED) {
-                blend.pAttachments(blendAttach);
-            }
+                var blendAttach = VkPipelineColorBlendAttachmentState.calloc(1, stack)
+                        .colorWriteMask(d.colorWrite ? 0xF : 0)
+                        .blendEnable(d.blend);
+                if (d.blend) {
+                    blendAttach.srcColorBlendFactor(VK_BLEND_FACTOR_SRC_ALPHA)
+                            .dstColorBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
+                            .colorBlendOp(VK_BLEND_OP_ADD)
+                            .srcAlphaBlendFactor(VK_BLEND_FACTOR_ONE)
+                            .dstAlphaBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
+                            .alphaBlendOp(VK_BLEND_OP_ADD);
+                }
+                var blend = VkPipelineColorBlendStateCreateInfo.calloc(stack).sType$Default();
+                if (d.colorFormat != VK_FORMAT_UNDEFINED) {
+                    blend.pAttachments(blendAttach);
+                }
 
-            var rendering = VkPipelineRenderingCreateInfoKHR.calloc(stack).sType$Default()
-                    .depthAttachmentFormat(d.depthFormat)
-                    .stencilAttachmentFormat(d.stencilFormat);
-            if (d.colorFormat != VK_FORMAT_UNDEFINED) {
-                rendering.colorAttachmentCount(1).pColorAttachmentFormats(stack.ints(d.colorFormat));
-            }
+                var rendering = VkPipelineRenderingCreateInfoKHR.calloc(stack).sType$Default()
+                        .depthAttachmentFormat(d.depthFormat)
+                        .stencilAttachmentFormat(d.stencilFormat);
+                if (d.colorFormat != VK_FORMAT_UNDEFINED) {
+                    rendering.colorAttachmentCount(1).pColorAttachmentFormats(stack.ints(d.colorFormat));
+                }
 
-            var gpci = VkGraphicsPipelineCreateInfo.calloc(1, stack).sType$Default()
-                    .pNext(rendering)
-                    .pStages(stages)
-                    .pVertexInputState(vertexInput)
-                    .pInputAssemblyState(inputAssembly)
-                    .pViewportState(viewportState)
-                    .pRasterizationState(raster)
-                    .pMultisampleState(msaa)
-                    .pDepthStencilState(depthState)
-                    .pColorBlendState(blend)
-                    .pDynamicState(dynamicState)
-                    .layout(this.pipelineLayout);
-            var pPipe = stack.mallocLong(1);
-            check(vkCreateGraphicsPipelines(vctx.device, VK_NULL_HANDLE, gpci, null, pPipe), "vkCreateGraphicsPipelines(" + d.name + ")");
-            this.pipeline = pPipe.get(0);
+                var gpci = VkGraphicsPipelineCreateInfo.calloc(1, stack).sType$Default()
+                        .pNext(rendering)
+                        .pStages(stages)
+                        .pVertexInputState(vertexInput)
+                        .pInputAssemblyState(inputAssembly)
+                        .pViewportState(viewportState)
+                        .pRasterizationState(raster)
+                        .pMultisampleState(msaa)
+                        .pDepthStencilState(depthState)
+                        .pColorBlendState(blend)
+                        .pDynamicState(dynamicState)
+                        .layout(this.pipelineLayout);
+                var pPipe = stack.mallocLong(1);
+                int result = vkCreateGraphicsPipelines(vctx.device, vctx.pipelineCache, gpci, null, pPipe);
+                if (result != VK_SUCCESS) {
+                    vkDestroyPipelineLayout(vctx.device, this.pipelineLayout, null);
+                    check(result, "vkCreateGraphicsPipelines(" + d.name + ")");
+                }
+                this.pipeline = pPipe.get(0);
+            } finally {
+                //Modules are only needed while pipelines are created from them
+                vkDestroyShaderModule(vctx.device, vertModule, null);
+                vkDestroyShaderModule(vctx.device, fragModule, null);
+            }
         }
     }
 
@@ -195,33 +220,26 @@ public final class VkShaderPipeline {
         return pMod.get(0);
     }
 
-    private static long createSetLayout(VulkanContext vctx, MemoryStack stack, List<Binding> bindings, int stages) {
-        //Intern by (bindings hash + stages): pipelines with identical binding
-        // tables (e.g. terrainOpaque and terrainTranslucent share the same
-        // bindings list) reuse one VkDescriptorSetLayout handle instead of each
-        // building + destroying its own.
-        long key = stages;
-        for (var b : bindings) {
-            key = key * 31L + b.binding() * 7L + b.type();
-        }
-        long deviceAddr = vctx.device.address();
-        var perDevice = LAYOUT_CACHE.computeIfAbsent(deviceAddr, k -> new java.util.concurrent.ConcurrentHashMap<>());
-        Long cached = perDevice.get(key);
-        if (cached != null) return cached;
-
-        var lb = VkDescriptorSetLayoutBinding.calloc(bindings.size(), stack);
-        for (int i = 0; i < bindings.size(); i++) {
-            var b = bindings.get(i);
-            lb.get(i).binding(b.binding()).descriptorType(b.type()).descriptorCount(1).stageFlags(stages);
-        }
-        var dslci = VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default()
-                .flags(VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR)
-                .pBindings(lb);
-        var pDsl = stack.mallocLong(1);
-        check(vkCreateDescriptorSetLayout(vctx.device, dslci, null, pDsl), "vkCreateDescriptorSetLayout");
-        long handle = pDsl.get(0);
-        perDevice.put(key, handle);
-        return handle;
+    private static long createSetLayout(VulkanContext vctx, List<Binding> bindings, int stages) {
+        //Interned by the exact (stages, binding table): pipelines with identical
+        // tables (e.g. terrainOpaque and terrainTranslucent) share one handle, owned
+        // and destroyed by the VulkanContext
+        var key = new LayoutKey(stages, List.copyOf(bindings));
+        return vctx.internDescriptorSetLayout(key, () -> {
+            try (MemoryStack stack = stackPush()) {
+                var lb = VkDescriptorSetLayoutBinding.calloc(bindings.size(), stack);
+                for (int i = 0; i < bindings.size(); i++) {
+                    var b = bindings.get(i);
+                    lb.get(i).binding(b.binding()).descriptorType(b.type()).descriptorCount(1).stageFlags(stages);
+                }
+                var dslci = VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default()
+                        .flags(VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR)
+                        .pBindings(lb);
+                var pDsl = stack.mallocLong(1);
+                check(vkCreateDescriptorSetLayout(vctx.device, dslci, null, pDsl), "vkCreateDescriptorSetLayout");
+                return pDsl.get(0);
+            }
+        });
     }
 
     private static long createPipelineLayout(VulkanContext vctx, MemoryStack stack, long setLayout, int pushBytes, int pushStages) {
@@ -301,15 +319,12 @@ public final class VkShaderPipeline {
         }
     }
 
+    //Deferred: frames still in flight may reference the pipeline (MC keeps up to two
+    // submissions in flight), so it is destroyed only once the current frame retires.
+    // The descriptor set layout is interned and owned by the VulkanContext.
     public void free() {
-        var device = this.ctx.vk().device;
-        vkDestroyPipeline(device, this.pipeline, null);
-        vkDestroyPipelineLayout(device, this.pipelineLayout, null);
-        //descriptorSetLayout is interned (shared across pipelines with identical
-        // bindings); never freed per-pipeline. Leaks are bounded by the device
-        // lifetime and the binding-table cardinality (a handful of distinct layouts).
-        for (long module : this.modules) {
-            vkDestroyShaderModule(device, module, null);
-        }
+        if (this.freed) return;
+        this.freed = true;
+        this.ctx.deferDestroyPipeline(this.pipeline, this.pipelineLayout);
     }
 }

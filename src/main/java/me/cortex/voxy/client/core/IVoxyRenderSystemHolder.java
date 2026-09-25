@@ -7,6 +7,8 @@ public interface IVoxyRenderSystemHolder {
     VoxyRenderSystem voxy$getRenderSystem();
     void voxy$shutdownRenderer();
     void voxy$createRenderer();
+    /** Runs a renderer creation deferred to a frame boundary (Vulkan path), if one is pending. */
+    void voxy$createPendingRenderer();
     //void voxy$reloadRenderer();
     void voxy$setWorld(Level level);
 

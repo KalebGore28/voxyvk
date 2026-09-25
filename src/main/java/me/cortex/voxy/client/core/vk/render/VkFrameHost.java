@@ -15,10 +15,19 @@ import static org.lwjgl.vulkan.VK10.*;
 //Accessors for MC's live Vulkan frame resources at the render hook point:
 // the world colour/depth attachment views MC is rendering into and the
 // lightmap texture view. All calls are render-thread only.
+//
+//Image layouts: MC 26.2's Vulkan backend transitions every texture it creates
+// UNDEFINED -> GENERAL once and then declares GENERAL everywhere (render-pass
+// attachments, descriptors, copies, clears); it never transitions again
+// (VulkanGpuTexture / VulkanCommandEncoder / VulkanRenderPass). Voxy must use
+// MC_IMAGE_LAYOUT for every access to an MC-owned image and must never change its
+// layout: only memory barriers are needed to order Voxy's accesses against MC's.
 public final class VkFrameHost {
+    public static final int MC_IMAGE_LAYOUT = VK_IMAGE_LAYOUT_GENERAL;
+
     private VkFrameHost() {}
 
-    /** VkImageView of MC's lightmap (bound as Voxy's terrain light sampler). */
+    /** VkImageView of MC's lightmap (bound as Voxy's terrain light sampler, layout MC_IMAGE_LAYOUT). */
     public static long lightmapView() {
         return ((VulkanGpuTextureView) Minecraft.getInstance().gameRenderer.levelLightmap()).vkImageView();
     }
@@ -31,51 +40,16 @@ public final class VkFrameHost {
         return VulkanConst.toVk(view.texture().getFormat());
     }
 
-    //Layout-transition one of MC's own images (colour/depth attachment) with
-    // scoped stage/access masks matching the actual producer/consumer — MC just
-    // rendered into the depth attachment (LATE_FRAGMENT_TESTS write), and Voxy
-    // samples it (FRAGMENT_SHADER read), so the previous ALL_COMMANDS masks
-    // (which serialised the transition with unrelated compute) are narrowed.
-    // Used to bracket sampling of MC's attachments mid-frame (they live in
-    // ATTACHMENT_OPTIMAL otherwise).
-    public static void transitionMcImage(VkCommandBuffer cmd, GpuTextureView view,
-                                          boolean depth, int oldLayout, int newLayout) {
+    //Execution + memory dependency on one of MC's colour/depth images. The layout
+    // stays MC_IMAGE_LAYOUT; callers pass the stages that actually produced/consume
+    // the access (e.g. SSAO reads MC's depth from a COMPUTE dispatch).
+    public static void mcImageBarrier(VkCommandBuffer cmd, GpuTextureView view, boolean depth,
+                                      int srcStage, int srcAccess, int dstStage, int dstAccess) {
         try (MemoryStack stack = stackPush()) {
             long image = ((VulkanGpuTexture) view.texture()).vkImage();
-            //MC's depth attachment is written by the late fragment tests; MC's
-            // colour by the fragment shader. Voxy reads both from the fragment
-            // shader (sampler). Reverse transitions are FRAGMENT_SHADER read ->
-            // late-fragment-tests write.
-            int srcStage, srcAccess, dstStage, dstAccess;
-            boolean toSampled = newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            if (depth) {
-                if (toSampled) {
-                    srcStage = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-                    srcAccess = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-                    dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-                    dstAccess = VK_ACCESS_SHADER_READ_BIT;
-                } else {
-                    srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-                    srcAccess = VK_ACCESS_SHADER_READ_BIT;
-                    dstStage = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-                    dstAccess = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-                }
-            } else {
-                if (toSampled) {
-                    srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-                    srcAccess = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                    dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-                    dstAccess = VK_ACCESS_SHADER_READ_BIT;
-                } else {
-                    srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-                    srcAccess = VK_ACCESS_SHADER_READ_BIT;
-                    dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-                    dstAccess = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                }
-            }
             var imb = VkImageMemoryBarrier.calloc(1, stack).sType$Default()
                     .srcAccessMask(srcAccess).dstAccessMask(dstAccess)
-                    .oldLayout(oldLayout).newLayout(newLayout)
+                    .oldLayout(MC_IMAGE_LAYOUT).newLayout(MC_IMAGE_LAYOUT)
                     .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
                     .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
                     .image(image);

@@ -8,6 +8,8 @@ import org.lwjgl.vulkan.VkInstance;
 import org.lwjgl.vulkan.VkPhysicalDevice;
 import org.lwjgl.vulkan.VkQueue;
 
+import static org.lwjgl.vulkan.VK13.VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
 //IVkHost backed by MC 26.2's live Blaze3D Vulkan device. The device-level
 // handles (instance/physical device/device/queue+family) are pulled directly
 // from MC's VulkanDevice and are stable for the device lifetime. The per-frame
@@ -22,6 +24,11 @@ public final class MinecraftVkHostAdapter implements IVkHost {
         this.device = device;
     }
 
+    /** True if this adapter wraps {@code device}. */
+    public boolean wraps(VulkanDevice device) {
+        return this.device == device;
+    }
+
     @Override public VkInstance instance() { return this.device.instance().vkInstance(); }
     @Override public VkPhysicalDevice physicalDevice() { return this.device.vkDevice().getPhysicalDevice(); }
     @Override public VkDevice device() { return this.device.vkDevice(); }
@@ -30,9 +37,17 @@ public final class MinecraftVkHostAdapter implements IVkHost {
 
     @Override
     public VkCommandBuffer frameCommandBuffer() {
-        //MC's persistent per-frame encoder; the command buffer it is currently
-        // recording into (null outside a render pass)
+        //createCommandEncoder() returns MC's single persistent encoder (it does not
+        // create one). This is the command buffer it is currently recording into;
+        // null when MC has recorded nothing since it last ended one.
         var encoder = (AccessorVulkanCommandEncoder) (Object) this.device.createCommandEncoder();
         return encoder.voxy$currentCommandBuffer();
+    }
+
+    @Override
+    public void signalSemaphore(long timelineSemaphore, long value) {
+        //Public Blaze3D API: ends MC's current command buffer and adds the signal to
+        // the pending submission (a later command buffer starts a new submit batch)
+        this.device.createCommandEncoder().signalSemaphore(timelineSemaphore, value, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
     }
 }

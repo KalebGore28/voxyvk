@@ -1,11 +1,14 @@
 #version 460 core
 #extension GL_ARB_gpu_shader_int64 : enable
-#define VISIBILITY_ACCESS
 
 #ifdef VOXY_VULKAN
+//Only raster.frag writes visibility. A writable SSBO in the vertex stage would need
+// the vertexPipelineStoresAndAtomics device feature, which MC does not enable.
+#define VISIBILITY_ACCESS readonly
 #define VERT_ID gl_VertexIndex
 #define INSTANCE_ID gl_InstanceIndex
 #else
+#define VISIBILITY_ACCESS
 #define VERT_ID gl_VertexID
 #define INSTANCE_ID gl_InstanceID
 #endif

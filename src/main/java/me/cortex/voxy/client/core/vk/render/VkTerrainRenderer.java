@@ -14,7 +14,6 @@ import me.cortex.voxy.common.Logger;
 import org.joml.Matrix4f;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
-import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkRect2D;
 import org.lwjgl.vulkan.VkRenderingAttachmentInfoKHR;
 import org.lwjgl.vulkan.VkRenderingInfoKHR;
@@ -22,8 +21,6 @@ import org.lwjgl.vulkan.VkRenderingInfoKHR;
 import java.util.List;
 
 import static org.lwjgl.system.MemoryStack.stackPush;
-import static org.lwjgl.vulkan.KHRDynamicRendering.vkCmdBeginRenderingKHR;
-import static org.lwjgl.vulkan.KHRDynamicRendering.vkCmdEndRenderingKHR;
 import static org.lwjgl.vulkan.VK10.*;
 import static org.lwjgl.vulkan.VK12.vkCmdDrawIndexedIndirectCount;
 
@@ -110,10 +107,10 @@ public class VkTerrainRenderer {
                         VkShaderPipeline.ssbo(3), VkShaderPipeline.ssbo(4), VkShaderPipeline.ssbo(5),
                         VkShaderPipeline.ssbo(6), VkShaderPipeline.ssbo(7)));
 
-        //Subgroup prefix sum on VK when the device advertises subgroup arithmetic
-        // (MoltenVK/Metal simdgroups, NVIDIA, AMD, Intel — virtually every VK 1.1+
-        // device). Falls back to the shared-memory Hillis-Steele scan otherwise.
-        boolean useSubgroup = ctx.vk().subgroupArithmetic;
+        //Subgroup prefix sum when compute shaders have subgroup arithmetic and a
+        // subgroup is wide enough (>= 16) to scan every per-subgroup total of the
+        // 256-wide group. Falls back to the shared-memory Hillis-Steele scan otherwise.
+        boolean useSubgroup = ctx.vk().supportsSubgroupPrefixSum();
         this.prefixSum = new VkShaderPipeline(ctx, "prefixsum.comp",
                 VkShaderSource.load(useSubgroup ? "voxy:util/prefixsum/inital3_vk.comp" : "voxy:util/prefixsum/simple.comp",
                         VkShaderSource.defs().def("IO_BUFFER", 0).build()),
@@ -134,8 +131,8 @@ public class VkTerrainRenderer {
         cullDesc.vertGlsl = VkShaderSource.load("voxy:lod/gl46/cull/raster.vert", VkShaderSource.defs().props(properties).build());
         cullDesc.fragGlsl = VkShaderSource.load("voxy:lod/gl46/cull/raster.frag", VkShaderSource.defs().props(properties).build());
         cullDesc.colorFormat = VK_FORMAT_UNDEFINED;
-        cullDesc.depthFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
-        cullDesc.stencilFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
+        cullDesc.depthFormat = ctx.vk().depthStencilFormat;//matches VkViewport.depthStencil
+        cullDesc.stencilFormat = ctx.vk().depthStencilFormat;
         cullDesc.depthTest = true;
         cullDesc.depthWrite = false;
         cullDesc.colorWrite = false;
@@ -204,7 +201,14 @@ public class VkTerrainRenderer {
     //==================================================================================
 
     private final Matrix4f uniformScratch = new Matrix4f();
+    private VkViewport uniformViewport;
+    private int uniformFrameId;
     public void uploadUniform(VkViewport viewport) {
+        //renderOpaque and buildDrawCalls both need it with identical contents; upload
+        // once per frame (the buffer is not written again until the next frame)
+        if (this.uniformViewport == viewport && this.uniformFrameId == viewport.frameId) return;
+        this.uniformViewport = viewport;
+        this.uniformFrameId = viewport.frameId;
         long ptr = this.uploadStream.upload(this.uniform, 0, 1024);
         var mat = this.uniformScratch.set(viewport.MVP);
         mat.translate(-viewport.innerTranslation.x, -viewport.innerTranslation.y, -viewport.innerTranslation.z);
@@ -259,7 +263,7 @@ public class VkTerrainRenderer {
         }
 
         {//raster occlusion test into the visibility buffer (depth-tested box draw, no writes)
-            this.beginRendering(cmd, viewport, 0L, true);//depth-only
+            this.beginRendering(viewport, 0L, true);//depth-only
             this.cullRaster.bind(cmd);
             VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
             try (var b = this.cullRaster.binder()) {
@@ -271,7 +275,7 @@ public class VkTerrainRenderer {
             }
             vkCmdBindIndexBuffer(cmd, this.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT16);
             vkCmdDrawIndexedIndirect(cmd, viewport.drawCountCallBuffer.buffer, 6 * 4, 1, 20);
-            vkCmdEndRenderingKHR(cmd);
+            this.ctx.endRendering();
             //The raster-cull draw wrote visibilityData (SSBO) from the fragment
             // shader; the consumer is the cmdgen compute. Scope to those stages
             // instead of the previous fullBarrier (ALL_COMMANDS -> ALL_COMMANDS)
@@ -335,7 +339,7 @@ public class VkTerrainRenderer {
             // fixed-count multi-draws track them instead of the worst-case section
             // cap (see fixedCountBudget). The counts live at opaque@12 / translucent@16
             // / temporal@20 in drawCountCallBuffer; download those 12 bytes on the same
-            // async, event-retired path the traversal request readback already uses
+            // async, frame-retired path the traversal request readback already uses
             // (commit() scopes its own COMPUTE->TRANSFER->HOST barriers). The callback
             // runs on the render thread from pollRetired, so the plain field writes are
             // race-free. Desktop (drawIndirectCount) neither needs nor issues this.
@@ -410,10 +414,11 @@ public class VkTerrainRenderer {
                 VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
                 VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDEX_READ_BIT);
 
-        this.beginRendering(cmd, viewport, colorView, !clear);//LOAD unless first pass (which cleared via compositor setup)
+        //Resolve everything that can throw BEFORE opening the rendering instance
+        long lightmapView = VkFrameHost.lightmapView();
+        this.beginRendering(viewport, colorView, !clear);//LOAD unless first pass (which cleared via compositor setup)
         pipeline.bind(cmd);
         VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
-        long lightmapView = VkFrameHost.lightmapView();
         try (var b = pipeline.binder()) {
             b.ubo(0, this.uniform)
                     .ssbo(1, this.geometry.geometryBuffer())
@@ -421,32 +426,30 @@ public class VkTerrainRenderer {
                     .ssbo(4, this.modelStore.modelColourBuffer)
                     .ssbo(5, viewport.positionScratchBuffer)
                     .sampler(8, this.modelStore.atlas.view, this.modelStore.atlasSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-                    .sampler(9, lightmapView, this.lightmapSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                    //MC's lightmap is an MC-owned image: always in MC_IMAGE_LAYOUT
+                    .sampler(9, lightmapView, this.lightmapSampler, VkFrameHost.MC_IMAGE_LAYOUT)
                     .sampler(10, viewport.depthBoundSampleView, this.depthBoundSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
                     .push(cmd);
         }
         vkCmdBindIndexBuffer(cmd, this.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT16);
         if (this.ctx.vk().hasDrawIndirectCount) {
             //Tight-count path: the GPU reads the actual draw count from the count
-            // buffer each frame. Requires the drawIndirectCount Vulkan 1.2 feature
-            // to be enabled on the device — desktop Vulkan (NVIDIA/AMD/Intel) enables
-            // it; MoltenVK does not (see the else branch).
+            // buffer each frame. Only taken when the drawIndirectCount feature was
+            // ENABLED on MC's device (Voxy requests it at device creation where
+            // supported: desktop NVIDIA/AMD/Intel, not MoltenVK).
             vkCmdDrawIndexedIndirectCount(cmd,
                     viewport.drawCallBuffer.buffer, indirectOffset,
                     viewport.drawCountCallBuffer.buffer, drawCountOffset,
                     maxDrawCount, 5 * 4);
         } else {
-            //MoltenVK/macOS fixed-count fallback: drawIndirectCount is not enabled
-            // on MC's adopted Vulkan device (MC's DeviceFeatures record does not
-            // even track it), and calling the function without the feature enabled
-            // is invalid usage that MoltenVK degenerates. The drawCallBuffer slice
-            // for this pass is zeroed per frame in buildDrawCalls (gated to this
-            // fallback path) so trailing slots past the actual command count read
-            // instanceCount=0 (no-op draws); a fixed-count multi-draw over the
-            // clamped maxDrawCount is therefore correct, just less tight.
+            //Fixed-count fallback (MoltenVK/macOS has no drawIndirectCount). The
+            // drawCallBuffer slice for this pass is zeroed per frame in buildDrawCalls
+            // (gated to this fallback path) so trailing slots past the actual command
+            // count read instanceCount=0 (no-op draws); a fixed-count multi-draw over
+            // the clamped maxDrawCount is therefore correct, just less tight.
             vkCmdDrawIndexedIndirect(cmd, viewport.drawCallBuffer.buffer, indirectOffset, maxDrawCount, 5 * 4);
         }
-        vkCmdEndRenderingKHR(cmd);
+        this.ctx.endRendering();
     }
 
     /**
@@ -454,8 +457,7 @@ public class VkTerrainRenderer {
      * happen in the depth-setup pass). {@code colorView} selects the colour
      * attachment (main colour vs SSAO output); 0 = depth-only.
      */
-    private void beginRendering(VkCommandBuffer cmd, VkViewport viewport,
-                                long colorView, boolean load) {
+    private void beginRendering(VkViewport viewport, long colorView, boolean load) {
         try (MemoryStack stack = stackPush()) {
             var depthAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
                     .imageView(viewport.depthStencil.view)
@@ -480,7 +482,7 @@ public class VkTerrainRenderer {
                         .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
                 info.pColorAttachments(colorAttach);
             }
-            vkCmdBeginRenderingKHR(cmd, info);
+            this.ctx.beginRendering(info);
         }
     }
 

@@ -18,8 +18,6 @@ import org.lwjgl.system.MemoryUtil;
 import java.util.List;
 
 import static org.lwjgl.system.MemoryStack.stackPush;
-import static org.lwjgl.vulkan.KHRDynamicRendering.vkCmdBeginRenderingKHR;
-import static org.lwjgl.vulkan.KHRDynamicRendering.vkCmdEndRenderingKHR;
 import static org.lwjgl.vulkan.VK10.*;
 
 //Pure-VK mirror of the GL BoundRenderer: rasterizes an AABB per Sodium-visible
@@ -116,6 +114,8 @@ public class VkBoundRenderer {
         }
 
         var cmd = this.ctx.cmd();
+        //Resolve everything that can throw BEFORE opening the rendering instance
+        VkBuffer chunkPositions = count != 0 ? (VkBuffer) store.getBuffer() : null;
         //Transition depthBound from whatever layout the previous frame left it in
         // (SHADER_READ_ONLY_OPTIMAL after the post-render transition below, or
         // UNDEFINED on first frame) to DEPTH_STENCIL_ATTACHMENT_OPTIMAL.
@@ -135,20 +135,20 @@ public class VkBoundRenderer {
                     .renderArea(org.lwjgl.vulkan.VkRect2D.calloc(stack).extent(e -> e.width(viewport.width).height(viewport.height)))
                     .layerCount(1)
                     .pDepthAttachment(depthAttach);
-            vkCmdBeginRenderingKHR(cmd, info);
+            this.ctx.beginRendering(info);
         }
         if (count != 0) {
             this.pipeline.bind(cmd);
             VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
             try (var b = this.pipeline.binder()) {
                 b.ubo(0, this.uniform)
-                        .ssbo(1, (VkBuffer) store.getBuffer())
+                        .ssbo(1, chunkPositions)
                         .push(cmd);
             }
             vkCmdBindIndexBuffer(cmd, this.boxIndexBuffer.buffer, 0, VK_INDEX_TYPE_UINT16);
             vkCmdDrawIndexed(cmd, 6 * 2 * 3, count, 0, 0, 0);
         }
-        vkCmdEndRenderingKHR(cmd);
+        this.ctx.endRendering();
 
         viewport.depthBound.transition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,

@@ -41,6 +41,14 @@ public class VkBuffer extends TrackedObject implements IDeviceBuffer, IRenderLis
     }
 
     public VkBuffer(VkFrameCtx ctx, long size, int usage, boolean hostVisible) {
+        this(ctx, size, usage,
+                hostVisible ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                0);
+    }
+
+    //requiredMemory must all be present on the chosen memory type; preferredMemory is
+    // used when some type also has it (e.g. HOST_CACHED for CPU readback buffers)
+    public VkBuffer(VkFrameCtx ctx, long size, int usage, int requiredMemory, int preferredMemory) {
         this.ctx = ctx;
         this.size = size;
         var vctx = ctx.vk();
@@ -49,20 +57,29 @@ public class VkBuffer extends TrackedObject implements IDeviceBuffer, IRenderLis
                     .size(size).usage(usage).sharingMode(VK_SHARING_MODE_EXCLUSIVE);
             var pBuf = stack.mallocLong(1);
             check(vkCreateBuffer(vctx.device, bci, null, pBuf), "vkCreateBuffer");
-            this.buffer = pBuf.get(0);
-
-            var req = VkMemoryRequirements.calloc(stack);
-            vkGetBufferMemoryRequirements(vctx.device, this.buffer, req);
-            int props = hostVisible
-                    ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-                    : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-            var mai = VkMemoryAllocateInfo.calloc(stack).sType$Default()
-                    .allocationSize(req.size())
-                    .memoryTypeIndex(vctx.findMemoryType(req.memoryTypeBits(), props));
-            var pMem = stack.mallocLong(1);
-            check(vkAllocateMemory(vctx.device, mai, null, pMem), "vkAllocateMemory");
-            this.memory = pMem.get(0);
-            check(vkBindBufferMemory(vctx.device, this.buffer, this.memory, 0), "vkBindBufferMemory");
+            long buffer = pBuf.get(0);
+            long memory = VK_NULL_HANDLE;
+            try {
+                var req = VkMemoryRequirements.calloc(stack);
+                vkGetBufferMemoryRequirements(vctx.device, buffer, req);
+                int memoryType = vctx.findMemoryType(req.memoryTypeBits(), requiredMemory, preferredMemory);
+                if (memoryType < 0) throw new IllegalStateException("No suitable VK memory type");
+                var mai = VkMemoryAllocateInfo.calloc(stack).sType$Default()
+                        .allocationSize(req.size())
+                        .memoryTypeIndex(memoryType);
+                var pMem = stack.mallocLong(1);
+                check(vkAllocateMemory(vctx.device, mai, null, pMem), "vkAllocateMemory");
+                memory = pMem.get(0);
+                check(vkBindBufferMemory(vctx.device, buffer, memory, 0), "vkBindBufferMemory");
+            } catch (RuntimeException e) {
+                //Allocation can legitimately fail (VkSectionGeometryData retries smaller);
+                // don't leak the buffer handle each time
+                if (memory != VK_NULL_HANDLE) vkFreeMemory(vctx.device, memory, null);
+                vkDestroyBuffer(vctx.device, buffer, null);
+                throw e;
+            }
+            this.buffer = buffer;
+            this.memory = memory;
         }
         COUNT++;
         TOTAL_SIZE += size;

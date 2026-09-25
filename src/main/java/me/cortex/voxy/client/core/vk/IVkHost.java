@@ -12,9 +12,8 @@ import org.lwjgl.vulkan.VkQueue;
  * not create a second device: it adopts the game's device and records into the
  * game's frame. An adapter implements this against Blaze3D's Vulkan internals.
  *
- * This is also THE macOS path: MoltenVK has no VK_KHR_external_memory_fd, so
- * the GL-interop hybrid can never run there — on Mac, Voxy-on-Vulkan requires
- * MC-on-Vulkan (which vanilla 26.2 officially supports via MoltenVK).
+ * This is also the macOS path: Voxy's GL backend needs OpenGL 4.6, which macOS
+ * does not have, so on Mac Voxy runs only when MC itself runs on Vulkan (MoltenVK).
  */
 public interface IVkHost {
     VkInstance instance();
@@ -25,4 +24,11 @@ public interface IVkHost {
 
     /** Command buffer currently recording for this frame's world rendering, at the LOD injection point. */
     VkCommandBuffer frameCommandBuffer();
+
+    /**
+     * Appends a timeline-semaphore signal to MC's pending queue submission. MC ends
+     * its current command buffer first, so the signal fires only after everything
+     * recorded before this call has executed on the GPU (and only once MC submits).
+     */
+    void signalSemaphore(long timelineSemaphore, long value);
 }

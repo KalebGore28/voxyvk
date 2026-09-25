@@ -20,8 +20,6 @@ import org.lwjgl.vulkan.VkRenderingInfoKHR;
 import java.util.List;
 
 import static org.lwjgl.system.MemoryStack.stackPush;
-import static org.lwjgl.vulkan.KHRDynamicRendering.vkCmdBeginRenderingKHR;
-import static org.lwjgl.vulkan.KHRDynamicRendering.vkCmdEndRenderingKHR;
 import static org.lwjgl.vulkan.VK10.*;
 
 //The two fullscreen passes bracketing Voxy's VK frame, mirroring the GL
@@ -117,8 +115,9 @@ public class VkCompositor {
                                GpuTextureView mcColour, GpuTextureView mcDepth,
                                int mcWidth, int mcHeight) {}
 
-    //SETUP pass. MC's depth image is transitioned to shader-read for sampling
-    // and back to attachment afterwards.
+    //SETUP pass. MC's depth image is sampled in place: MC keeps it in
+    // VkFrameHost.MC_IMAGE_LAYOUT (GENERAL) permanently, so only a memory barrier is
+    // needed; transitioning it (as this used to) left it in a layout MC doesn't expect.
     public void setupDepthStencil(VkViewportRT rt) {
         this.ensureSetupPipeline(rt);
         var cmd = this.ctx.cmd();
@@ -139,9 +138,10 @@ public class VkCompositor {
         // there are no visible sections). Leave depthBound in its current layout;
         // VkBoundRenderer transitions it to DEPTH_STENCIL_ATTACHMENT directly.
 
-        //MC depth -> sample-able
-        VkFrameHost.transitionMcImage(cmd, rt.mcDepth, true,
-                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        //MC's depth writes (Sodium's opaque terrain) -> this pass's fragment-shader read
+        VkFrameHost.mcImageBarrier(cmd, rt.mcDepth, true,
+                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 
         try (MemoryStack stack = stackPush()) {
             var colorAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
@@ -168,12 +168,12 @@ public class VkCompositor {
                     .pColorAttachments(colorAttach)
                     .pDepthAttachment(depthAttach)
                     .pStencilAttachment(stencilAttach);
-            vkCmdBeginRenderingKHR(cmd, info);
+            this.ctx.beginRendering(info);
         }
         this.depthSetup.bind(cmd);
         VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
         try (var b = this.depthSetup.binder()) {
-            b.sampler(0, VkFrameHost.vkView(rt.mcDepth), this.depthSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+            b.sampler(0, VkFrameHost.vkView(rt.mcDepth), this.depthSampler, VkFrameHost.MC_IMAGE_LAYOUT)
                     .push(cmd);
         }
         try (MemoryStack stack = stackPush()) {
@@ -183,11 +183,9 @@ public class VkCompositor {
             this.depthSetup.pushConstants(cmd, pc);
         }
         vkCmdDraw(cmd, 4, 1, 0, 0);
-        vkCmdEndRenderingKHR(cmd);
-
-        //MC depth back to attachment
-        VkFrameHost.transitionMcImage(cmd, rt.mcDepth, true,
-                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        this.ctx.endRendering();
+        //(no transition back: MC's depth never left MC_IMAGE_LAYOUT. The composite
+        // orders its depth writes after this read.)
     }
 
     /** Transition Voxy's offscreen targets for sampling (HiZ build / composite). */
@@ -258,15 +256,29 @@ public class VkCompositor {
                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
         //(depth already SHADER_READ from the HiZ stage — offscreenToSampled)
 
+        //This pass writes MC's colour + depth (in MC_IMAGE_LAYOUT). Order it after
+        // every earlier access in Voxy's frame: the setup pass (fragment) and
+        // BETTER/BEST SSAO (compute) sampled MC's depth, and MC's own last writes.
+        int mcAccessStages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+                | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        VkFrameHost.mcImageBarrier(cmd, rt.mcColour, false,
+                mcAccessStages, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+        VkFrameHost.mcImageBarrier(cmd, rt.mcDepth, true,
+                mcAccessStages, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+
         try (MemoryStack stack = stackPush()) {
             var colorAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
                     .imageView(VkFrameHost.vkView(rt.mcColour))
-                    .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                    .imageLayout(VkFrameHost.MC_IMAGE_LAYOUT)
                     .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
                     .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
             var depthAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
                     .imageView(VkFrameHost.vkView(rt.mcDepth))
-                    .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                    .imageLayout(VkFrameHost.MC_IMAGE_LAYOUT)
                     .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
                     .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
             var info = VkRenderingInfoKHR.calloc(stack).sType$Default()
@@ -274,7 +286,7 @@ public class VkCompositor {
                     .layerCount(1)
                     .pColorAttachments(colorAttach)
                     .pDepthAttachment(depthAttach);
-            vkCmdBeginRenderingKHR(cmd, info);
+            this.ctx.beginRendering(info);
         }
         this.composite.bind(cmd);
         VkCmd.setViewportScissor(cmd, rt.mcWidth, rt.mcHeight);
@@ -285,7 +297,9 @@ public class VkCompositor {
                     .push(cmd);
         }
         vkCmdDraw(cmd, 4, 1, 0, 0);
-        vkCmdEndRenderingKHR(cmd);
+        this.ctx.endRendering();
+        //MC's later passes are ordered after these writes by the full barrier
+        // VkFrameCtx.endFrame records at the end of Voxy's frame
     }
 
     public void free() {

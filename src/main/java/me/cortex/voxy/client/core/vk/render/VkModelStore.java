@@ -84,15 +84,15 @@ public class VkModelStore implements IModelStore {
     }
 
     @Override
-    public void uploadModelTexture(int modelId, MemoryBuffer texture) {
+    public void uploadModelTexture(int modelId, MemoryBuffer texture, int mipLevels) {
         if (!this.inUploadBatch) throw new IllegalStateException("Texture upload outside batch");
         final int TS = ModelFactory.MODEL_TEXTURE_SIZE;
         int X = (modelId & 0xFF) * TS * 3;
         int Y = ((modelId >> 8) & 0xFF) * TS * 2;
 
-        //Stage the full mip chain in one staging allocation
+        //Stage the mip chain in one staging allocation (only the levels the texture holds)
         int totalBytes = 0;
-        for (int lvl = 0; lvl < ModelFactory.LAYERS; lvl++) {
+        for (int lvl = 0; lvl < mipLevels; lvl++) {
             totalBytes += (TS * TS * 3 * 2 * 4) >> (lvl << 1);
         }
         long stageOff = this.uploadStream.rawUploadAddress(totalBytes);
@@ -100,9 +100,9 @@ public class VkModelStore implements IModelStore {
 
         var cmd = this.ctx.cmd();
         try (MemoryStack stack = stackPush()) {
-            var regions = VkBufferImageCopy.calloc(ModelFactory.LAYERS, stack);
+            var regions = VkBufferImageCopy.calloc(mipLevels, stack);
             long srcOff = stageOff;
-            for (int lvl = 0; lvl < ModelFactory.LAYERS; lvl++) {
+            for (int lvl = 0; lvl < mipLevels; lvl++) {
                 final int flvl = lvl;
                 var r = regions.get(lvl);
                 r.bufferOffset(srcOff).bufferRowLength(0).bufferImageHeight(0);

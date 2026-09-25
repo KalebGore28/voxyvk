@@ -5,6 +5,8 @@ import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
 import me.cortex.voxy.client.core.util.IrisUtil;
+import me.cortex.voxy.client.core.vk.MinecraftVkHost;
+import me.cortex.voxy.client.core.vk.VulkanBackend;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.commonImpl.VoxyCommon;
@@ -24,6 +26,7 @@ import java.util.Objects;
 public abstract class MixinLevelRenderer implements IVoxyRenderSystemHolder {
     @Unique @Nullable private WorldIdentifier identifier;
     @Unique private @Nullable VoxyRenderSystem renderer;
+    @Unique private boolean voxy$pendingCreate;
 
     @Override
     public VoxyRenderSystem voxy$getRenderSystem() {
@@ -37,6 +40,7 @@ public abstract class MixinLevelRenderer implements IVoxyRenderSystemHolder {
 
     @Override
     public void voxy$shutdownRenderer() {
+        this.voxy$pendingCreate = false;
         if (this.renderer != null) {
             this.renderer.shutdown();
             this.renderer = null;
@@ -61,6 +65,28 @@ public abstract class MixinLevelRenderer implements IVoxyRenderSystemHolder {
     @Override
     public void voxy$createRenderer() {
         if (this.renderer != null) throw new IllegalStateException("Cannot have multiple renderers");
+        if (MinecraftVkHost.isMinecraftOnVulkan()) {
+            //Vulkan: build it at the next frame boundary (MixinMinecraftFrameStart).
+            // Requests can arrive mid-frame (LevelExtractor.allChanged after a resource
+            // reload), when MC still holds unsubmitted GPU work such as the new block
+            // atlas upload; construction submits its own work (the atlas readback)
+            // immediately, which would then run BEFORE MC's and read the stale atlas.
+            this.voxy$pendingCreate = true;
+            return;
+        }
+        this.voxy$createRendererNow();
+    }
+
+    @Override
+    public void voxy$createPendingRenderer() {
+        if (!this.voxy$pendingCreate) return;
+        this.voxy$pendingCreate = false;
+        if (this.renderer != null) return;
+        this.voxy$createRendererNow();
+    }
+
+    @Unique
+    private void voxy$createRendererNow() {
         if (!VoxyConfig.CONFIG.enabled) {
             Logger.info("Not creating renderer due to disabled");
             return;
@@ -77,6 +103,12 @@ public abstract class MixinLevelRenderer implements IVoxyRenderSystemHolder {
         if (instance == null) {
             //This is now legal (e.g. when the instance is disabled)
             Logger.info("Not creating renderer due to null instance");
+            return;
+        }
+        if (MinecraftVkHost.isMinecraftOnVulkan() && !VulkanBackend.shouldUseVulkan()) {
+            //No GL context exists while MC is on Vulkan, so there is no fallback
+            Logger.error("Not creating renderer: Minecraft is on Vulkan but Voxy's Vulkan backend is unavailable ("
+                    + VulkanBackend.statusLine() + ")");
             return;
         }
         WorldEngine world = this.identifier.getOrCreateEngine(true);

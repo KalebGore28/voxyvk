@@ -613,6 +613,10 @@ public class AsyncNodeManager {
     }
 
     public void submitRequestBatch(MemoryBuffer batch) {//Only called from render thread
+        if (!this.running) {//e.g. a GPU readback delivered during teardown: nothing will drain the queue
+            batch.free();
+            return;
+        }
         this.requestBatchQueue.add(batch);
         this.addWork();
     }
@@ -636,6 +640,10 @@ public class AsyncNodeManager {
     }
 
     public void submitRemoveBatch(MemoryBuffer batch) {//Only called from render thread
+        if (!this.running) {//e.g. a GPU readback delivered during teardown: nothing will drain the queue
+            batch.free();
+            return;
+        }
         this.removeBatchQueue.add(batch);
         this.addWork();
     }

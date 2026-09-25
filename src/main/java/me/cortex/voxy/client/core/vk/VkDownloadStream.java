@@ -17,8 +17,8 @@ import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.VK10.*;
 
 //Pure-VK GPU->CPU readback: vkCmdCopyBuffer into a host-visible readback
-// buffer at commit(); callbacks fire from tick() once the producing frame's
-// event has signaled (the copy provably completed). Mirrors the GL
+// buffer at commit(); callbacks fire (from VkFrameCtx retirement) once the
+// producing frame has retired (the copy provably completed). Mirrors the GL
 // DownloadStream fence/frame model.
 public class VkDownloadStream extends AbstractDownloadStream {
     private final VkFrameCtx ctx;
@@ -43,7 +43,12 @@ public class VkDownloadStream extends AbstractDownloadStream {
 
     public VkDownloadStream(VkFrameCtx ctx, long size) {
         this.ctx = ctx;
-        this.readbackBuffer = new VkBuffer(ctx, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+        //The CPU reads this memory: prefer a HOST_CACHED type (on discrete GPUs the
+        // first coherent type is usually uncached write-combined, which is very slow
+        // to read). Coherent either way, so no invalidate is needed.
+        this.readbackBuffer = new VkBuffer(ctx, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
         this.readbackPtr = this.readbackBuffer.map();
         this.allocationArena.setLimit(size);
         ctx.addRetireListener(this::retireUpTo);
@@ -85,7 +90,7 @@ public class VkDownloadStream extends AbstractDownloadStream {
     public void commit() {
         if (this.downloadList.isEmpty()) return;
         //Capture the frame currently being recorded — the copies below land in its
-        // command buffer and complete when its event signals.
+        // command buffer and complete when that frame retires.
         this.recordFrame = this.ctx.currentFrame();
         var cmd = this.ctx.cmd();
         //Source buffers are compute/raster/transfer outputs; narrow from ALL_COMMANDS
@@ -126,20 +131,27 @@ public class VkDownloadStream extends AbstractDownloadStream {
     private void retireUpTo(long retiredFrame) {
         while (!this.frames.isEmpty() && this.frames.peek().frameIdx <= retiredFrame) {
             var frame = this.frames.pop();
-            for (var data : frame.data) {
-                data.resultConsumer.consume(this.readbackPtr + data.downloadStreamOffset, data.size);
+            if (!frame.discard) {
+                for (var data : frame.data) {
+                    data.resultConsumer.consume(this.readbackPtr + data.downloadStreamOffset, data.size);
+                }
             }
             frame.allocations.forEach(this.allocationArena::free);
         }
     }
 
+    //GL semantics: complete in-flight copies and drop every pending readback WITHOUT
+    // invoking its callback. (This used to call waitIdleRetireAll first, whose retire
+    // listener fired all the callbacks it was meant to discard.) A frame that cannot
+    // retire yet (still unsubmitted) keeps its readback space until it does; only its
+    // callbacks are dropped.
     @Override
     public void waitDiscard() {
-        this.ctx.waitIdleRetireAll();
-        while (!this.frames.isEmpty()) {
-            var frame = this.frames.pop();
-            frame.allocations.forEach(this.allocationArena::free);
+        this.tick();
+        for (var frame : this.frames) {
+            frame.discard = true;
         }
+        this.ctx.waitIdleRetireAll();
     }
 
     @Override
@@ -157,6 +169,17 @@ public class VkDownloadStream extends AbstractDownloadStream {
         this.readbackBuffer.free();
     }
 
-    private record DownloadFrame(long frameIdx, LongArrayList allocations, ArrayList<DownloadData> data) {}
+    private static final class DownloadFrame {
+        final long frameIdx;
+        final LongArrayList allocations;
+        final ArrayList<DownloadData> data;
+        boolean discard;//retire without invoking the callbacks (waitDiscard)
+
+        DownloadFrame(long frameIdx, LongArrayList allocations, ArrayList<DownloadData> data) {
+            this.frameIdx = frameIdx;
+            this.allocations = allocations;
+            this.data = data;
+        }
+    }
     private record DownloadData(VkBuffer target, long downloadStreamOffset, long targetOffset, long size, DownloadResultConsumer resultConsumer) {}
 }

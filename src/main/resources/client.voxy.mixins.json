@@ -39,7 +39,9 @@
     "sodium.MixinSodiumWorldRenderer",
     "sodium.MixinVisibleChunkCollector",
     "vk.AccessorVulkanCommandEncoder",
+    "vk.MixinMinecraftFrameStart",
     "vk.MixinSodiumOpaqueVkFrame",
+    "vk.MixinVulkanBackend",
     "vk.MixinVulkanDevice"
   ],
   "injectors": {

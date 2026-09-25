@@ -21,6 +21,7 @@ import me.cortex.voxy.client.core.vk.VkDownloadStream;
 import me.cortex.voxy.client.core.vk.VkFrameCtx;
 import me.cortex.voxy.client.core.vk.VkUploadStream;
 import me.cortex.voxy.client.core.vk.VulkanBackend;
+import me.cortex.voxy.client.core.vk.VulkanContext;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.thread.ServiceManager;
 import me.cortex.voxy.common.world.WorldEngine;
@@ -28,6 +29,7 @@ import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
 import net.caffeinemc.mods.sodium.client.util.FogParameters;
 import net.minecraft.client.Minecraft;
 
+import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.List;
 
@@ -66,18 +68,29 @@ public class VkRenderCore {
     public VkRenderCore(WorldEngine world, ServiceManager sm) {
         world.acquireRef();
         Logger.info("Creating Voxy pure-Vulkan render core");
+        //Construction is all-or-nothing: every resource registers its teardown as soon
+        // as it exists, so a failure part-way (shader compile error, allocation
+        // failure...) releases everything and clears the global stream/reader
+        // singletons, instead of leaking them and making every later attempt fail
+        // with "already initialized" until the game restarts.
+        var undo = new ArrayDeque<Runnable>();
         try {
             this.worldIn = world;
             var host = MinecraftVkHost.get();
             if (host == null) throw new IllegalStateException("No Minecraft Vulkan host adapter registered");
             var vctx = VulkanBackend.context();//adopts MC's device
-            this.frameCtx = new VkFrameCtx(vctx);
+            this.frameCtx = new VkFrameCtx(vctx, host);
+            undo.push(this.frameCtx::free);//runs last: waits for the GPU, then destroys everything deferred
 
             //Install the VK streams BEFORE any shared class touches the singletons
             this.uploadStream = new VkUploadStream(this.frameCtx, 1 << 26);//64 mb, same as GL
+            undo.push(this.uploadStream::free);
             this.downloadStream = new VkDownloadStream(this.frameCtx, 1 << 25);//32 mb, same as GL
+            undo.push(this.downloadStream::free);
             AbstractUploadStream.setInstance(this.uploadStream);
+            undo.push(AbstractUploadStream::clearInstance);
             AbstractDownloadStream.setInstance(this.downloadStream);
+            undo.push(AbstractDownloadStream::clearInstance);
 
             this.properties = RenderProperties.getRenderProperties();
 
@@ -85,36 +98,58 @@ public class VkRenderCore {
             // (its constructor does a synchronous GPU->CPU copy)
             IAtlasTextureReader.setInstance(
                     new VkAtlasTextureReader(this.frameCtx));
+            undo.push(IAtlasTextureReader::clearInstance);
 
             this.modelStore = new VkModelStore(this.frameCtx, this.uploadStream);
+            undo.push(this.modelStore::free);
             this.modelService = new ModelBakerySubsystem(world.getMapper(), this.modelStore);
+            undo.pop();//from here modelService.shutdown() owns (and frees) the store
+            undo.push(this.modelService::shutdown);
             this.renderGen = new RenderGenerationService(world, this.modelService, sm, false);
+            undo.push(this.renderGen::shutdown);
 
-            this.geometryData = new VkSectionGeometryData(this.frameCtx, 1 << 20, geometryCapacity());
-            this.nodeManager = new AsyncNodeManager(1 << 21, this.geometryData, this.renderGen,
-                    new VkNodeGpuOps(this.frameCtx, this.uploadStream));
+            this.geometryData = new VkSectionGeometryData(this.frameCtx, 1 << 20, geometryCapacity(vctx));
+            undo.push(this.geometryData::free);
+            var gpuOps = new VkNodeGpuOps(this.frameCtx, this.uploadStream);
+            undo.push(gpuOps::free);
+            this.nodeManager = new AsyncNodeManager(1 << 21, this.geometryData, this.renderGen, gpuOps);
+            undo.pop();//stop() frees the GPU ops, and is valid even before start()
+            undo.push(this.nodeManager::stop);
             this.nodeCleaner = new VkNodeCleaner(this.frameCtx, this.uploadStream, this.downloadStream, this.nodeManager);
+            undo.push(this.nodeCleaner::free);
             this.traversal = new VkTraversal(this.frameCtx, this.uploadStream, this.downloadStream,
                     this.properties, this.nodeManager, this.nodeCleaner, this.renderGen);
+            undo.push(this.traversal::free);
             this.terrainRenderer = new VkTerrainRenderer(this.frameCtx, this.uploadStream, this.downloadStream,
                     this.properties, this.geometryData, this.modelStore);
+            undo.push(this.terrainRenderer::free);
             this.compositor = new VkCompositor(this.frameCtx, this.uploadStream, this.properties,
                     VoxyConfig.CONFIG.getFogMode().hasFog);
+            undo.push(this.compositor::free);
             this.ssao = new VkSSAO(this.frameCtx, this.uploadStream, this.properties, VoxyConfig.CONFIG.getSSAOMode());
+            undo.push(this.ssao::free);
             //Depth-bound culling: Sodium's visibility mixins feed the store; the bound
             // renderer rasters visible-chunk AABBs into the depth-bound image so the
             // terrain shaders can discard LOD fragments vanilla terrain will cover.
             this.visibleSectionStream = new StreamedBoundStore(
                     size -> new VkBuffer(this.frameCtx, size));
+            undo.push(this.visibleSectionStream::free);
             this.boundRenderer = new VkBoundRenderer(this.frameCtx, this.uploadStream, this.properties);
+            undo.push(this.boundRenderer::free);
 
             world.setDirtyCallback(this.nodeManager::worldEvent);
             Arrays.stream(world.getMapper().getBiomeEntries()).forEach(this.modelService::addBiome);
             world.getMapper().setBiomeCallback(this.modelService::addBiome);
+            undo.push(() -> {
+                world.setDirtyCallback(null);
+                world.getMapper().setBiomeCallback(null);
+                world.getMapper().setStateCallback(null);
+            });
             this.nodeManager.start();
 
             this.viewportSelector = new ViewportSelector<>(() ->
                     new VkViewport(this.frameCtx, this.properties, this.geometryData.getMaxSectionCount()));
+            undo.push(this.viewportSelector::free);
 
             int minSec = Minecraft.getInstance().level.getMinSectionY() >> 5;
             int maxSec = (Minecraft.getInstance().level.getMaxSectionY() - 1) >> 5;
@@ -124,15 +159,31 @@ public class VkRenderCore {
 
             this.frameCtx.flushImmediate();
             Logger.info("Voxy pure-Vulkan render core created with " + this.geometryData.getMaxCapacity() + " geometry capacity");
-        } catch (RuntimeException e) {
+        } catch (Throwable t) {
+            Logger.error("Failed to create the Voxy Vulkan render core; releasing partial state", t);
+            //Reverse creation order. The frame ctx was registered first, so it runs last:
+            // it waits for the GPU, then destroys everything the steps above deferred.
+            while (!undo.isEmpty()) {
+                try {
+                    undo.pop().run();
+                } catch (Throwable t2) {
+                    Logger.error("Error while releasing a partially created VK render core", t2);
+                }
+            }
             world.releaseRef();
-            throw e;
+            if (t instanceof RuntimeException re) throw re;
+            if (t instanceof Error err) throw err;
+            throw new RuntimeException(t);
         }
     }
 
-    private static long geometryCapacity() {
-        //Conservative fixed allocation (no sparse residency tricks on VK): 2GB, halved on failure inside VkSectionGeometryData
-        return 2048L << 20;
+    private static long geometryCapacity(VulkanContext vctx) {
+        //Conservative fixed allocation (no sparse residency tricks on VK): 2GB, halved
+        // on allocation failure inside VkSectionGeometryData. It is bound as ONE storage
+        // buffer and is ONE allocation, so it must also fit maxStorageBufferRange (the
+        // spec only guarantees 128 MiB) and maxMemoryAllocationSize.
+        long capacity = Math.min(2048L << 20, Math.min(vctx.maxStorageBufferRange, vctx.maxMemoryAllocationSize));
+        return capacity & ~7L;//VkSectionGeometryData requires a multiple of 8
     }
 
     //Renders one Voxy frame into MC's frame command buffer. Called from the
@@ -251,28 +302,45 @@ public class VkRenderCore {
         this.shutDown = true;
         Logger.info("Shutting down Voxy pure-Vulkan render core");
 
-        //CPU-only stop first: detach world callbacks and join the node/gen worker
-        // threads (both produce CPU data only — GPU upload happens on the render
-        // thread), so nothing can enqueue more work while we tear down. The model
-        // bakery is NOT stopped here — its shutdown() frees GPU resources
-        // (VkModelStore), so it must run AFTER the device is idle.
+        //Only touch the GPU if MC's adopted device is still alive. MixinVulkanDevice
+        // shuts Voxy down before the host is cleared on VulkanDevice.close(), so this
+        // is a safety net: issuing vkDeviceWaitIdle / vkDestroy* against a destroyed
+        // device is a use-after-free in the driver, and if the host is already gone
+        // the objects are unreachable anyway, so leaking them is strictly safer.
+        boolean deviceAlive = MinecraftVkHost.get() != null;
+
         try {
             this.worldIn.setDirtyCallback(null);
             this.worldIn.getMapper().setBiomeCallback(null);
             this.worldIn.getMapper().setStateCallback(null);
+        } catch (Exception e) {
+            Logger.error("Error detaching VK render core world callbacks", e);
+        }
+
+        if (deviceAlive) {
+            //Deliver the in-flight readbacks (traversal node requests, cleaner removals)
+            // while the node manager still accepts them, as the GL path does before
+            // stopping anything; afterwards they would be dropped
+            try {
+                this.downloadStream.flushWaitClear();
+            } catch (Exception e) {
+                Logger.error("Error flushing VK render core readbacks", e);
+            }
+        }
+
+        //Join the node/gen worker threads (both produce CPU data only; GPU work is
+        // recorded on the render thread), so nothing enqueues more work while we
+        // tear down. nodeManager.stop() also frees its GPU pipelines, which is safe
+        // here because VkShaderPipeline.free() only DEFERS destruction to the frame
+        // ctx. The model bakery is NOT stopped here — its shutdown() frees GPU
+        // resources (VkModelStore), so it must run AFTER the device is idle.
+        try {
             this.nodeManager.stop();
             this.renderGen.shutdown();
         } catch (Exception e) {
             Logger.error("Error stopping VK render core CPU services", e);
         }
 
-        //Only touch the GPU if MC's adopted device is still alive. On full game
-        // exit MC's VulkanDevice.close() (which clears the host) can run before
-        // the level renderer closes; issuing vkDeviceWaitIdle / vkDestroy*
-        // against a destroyed device is a use-after-free in the driver. If the
-        // host is already gone the objects are unreachable anyway, so leaking
-        // them is strictly safer than a native crash.
-        boolean deviceAlive = MinecraftVkHost.get() != null;
         if (deviceAlive) {
             try {
                 //Idle the device BEFORE destroying anything, so no destroy races

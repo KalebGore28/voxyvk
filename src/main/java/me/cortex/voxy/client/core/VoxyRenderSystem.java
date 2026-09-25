@@ -89,8 +89,14 @@ public class VoxyRenderSystem {
         //Keep the world loaded, NOTE: this is done FIRST, to keep and ensure that even if the rest of loading takes more
         // than timeout, we keep the world acquired
         //When MC itself renders through Vulkan there is no GL context at all; the
-        // entire renderer is the VkRenderCore and nothing below may run.
-        if (me.cortex.voxy.client.core.vk.VulkanBackend.shouldUseVulkan()) {
+        // entire renderer is the VkRenderCore and nothing below may run. "MC on Vulkan"
+        // and "Voxy's VK backend usable" are separate questions: falling through to the
+        // GL path in the first-but-not-second case would issue GL calls with no context.
+        if (me.cortex.voxy.client.core.vk.MinecraftVkHost.isMinecraftOnVulkan()) {
+            if (!me.cortex.voxy.client.core.vk.VulkanBackend.shouldUseVulkan()) {
+                throw new IllegalStateException("Minecraft is on Vulkan but Voxy's Vulkan backend is unavailable ("
+                        + me.cortex.voxy.client.core.vk.VulkanBackend.statusLine() + ")");
+            }
             this.worldIn = world;
             this.vkCore = new me.cortex.voxy.client.core.vk.render.VkRenderCore(world, sm);
             this.visbleSectionStream = this.vkCore.getVisibleSectionStream();//Sodium visibility mixins feed it on VK too

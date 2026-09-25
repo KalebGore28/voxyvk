@@ -11,8 +11,8 @@ import me.cortex.voxy.client.core.vk.VkImage2D;
 import static org.lwjgl.vulkan.VK10.*;
 
 //Pure-VK viewport: the MDICViewport buffer set as VkBuffers, plus the
-// offscreen render targets (colour + D32S8 depth-stencil), the depth-bound
-// image (vanilla-coverage optimisation), and the HiZ pyramid.
+// offscreen render targets (colour + depth-stencil), the depth-bound image
+// (vanilla-coverage optimisation), and the HiZ pyramid.
 public class VkViewport extends Viewport<VkViewport> {
     public static final int OPAQUE_DRAW_COUNT = 400_000;
     public static final int TRANSLUCENT_DRAW_COUNT = 100_000;
@@ -73,16 +73,13 @@ public class VkViewport extends Viewport<VkViewport> {
                 VK_FORMAT_R8G8B8A8_UNORM,
                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
                 VK_IMAGE_ASPECT_COLOR_BIT, false);
+        //D32S8 when the device can attach + sample it, else D24S8 (VulkanContext).
+        // The depth-only sampling view uses the same format with ASPECT_DEPTH; no
+        // mutable-format flag is needed (or valid) for that.
         this.depthStencil = new VkImage2D(this.ctx, this.width, this.height, 1,
-                VK_FORMAT_D32_SFLOAT_S8_UINT,
+                this.ctx.vk().depthStencilFormat,
                 VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, false,
-                //VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT + view-format list lets the
-                // depth-only aspect view alias the image directly. Without this,
-                // MoltenVK may have to synthesise a separate staging texture for
-                // depth-only sampling of a packed D32S8 image. The list must
-                // contain the original format plus the depth-only format.
-                new int[]{VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D32_SFLOAT});
+                VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, false);
         this.depthSampleView = this.depthStencil.createAspectView(VK_IMAGE_ASPECT_DEPTH_BIT);
         this.depthBound = new VkImage2D(this.ctx, this.width, this.height, 1,
                 VK_FORMAT_D32_SFLOAT,

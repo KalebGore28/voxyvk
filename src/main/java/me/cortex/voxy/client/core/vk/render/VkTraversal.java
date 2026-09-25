@@ -32,19 +32,11 @@ public class VkTraversal {
     public static final int MAX_REQUEST_QUEUE_SIZE = HierarchicalOcclusionTraverser.MAX_REQUEST_QUEUE_SIZE;
     public static final int MAX_QUEUE_SIZE = HierarchicalOcclusionTraverser.MAX_QUEUE_SIZE;
     private static final int MAX_ITERATIONS = WorldEngine.MAX_LOD_LAYER + 1;
-    //Traversal workgroup size: 64 threads (2 subgroups on 32-wide devices, 1 on
-    // 64-wide AMD) improves HiZ texture cache locality and amortises dispatch
-    // overhead over the 32-thread default. Falls back to 32 (one subgroup) when
-    // subgroup support is unavailable. The shader's LOCAL_SIZE is driven by this
-    // define, and queue.glsl's push math is LOCAL_SIZE-parametric, so no shader
-    // change is needed.
-    private final int localWorkSizeBits;
-
-    private static int resolveLocalWorkSizeBits(VkFrameCtx ctx) {
-        //subgroupSize >= 32 on every conformant Vulkan 1.1+ device; bump to 64
-        // (2 subgroups) when subgroupSize >= 32. Conservative 32 fallback otherwise.
-        return ctx.vk().subgroupArithmetic && ctx.vk().subgroupSize >= 32 ? 6 : 5;
-    }
+    //Traversal workgroup size: 32 threads, same as the GL traverser
+    // (HierarchicalOcclusionTraverser.LOCAL_WORK_SIZE_BITS). The traversal uses no
+    // subgroup ops; a 64-wide variant used to be gated on the subgroup query, which
+    // never reported support (see VulkanContext), so it was never actually run.
+    private final int localWorkSizeBits = 5;
 
     //Bindings (single Vulkan namespace: HiZ sampler at 0, UBO at 1, SSBOs from 2)
     private static final int HIZ_BINDING = 0;
@@ -86,7 +78,6 @@ public class VkTraversal {
         this.nodeManager = nodeManager;
         this.nodeCleaner = nodeCleaner;
         this.meshGen = meshGen;
-        this.localWorkSizeBits = resolveLocalWorkSizeBits(ctx);
 
         this.requestBuffer = new VkBuffer(ctx, MAX_REQUEST_QUEUE_SIZE * 8L + 8).zero();
         this.nodeBuffer = new VkBuffer(ctx, nodeManager.maxNodeCount * 16L).fill(-1);
@@ -239,6 +230,11 @@ public class VkTraversal {
 
         //Download + reset the request queue
         this.downloadStream.download(this.requestBuffer, this::forwardDownloadResult);
+        //The download's copy READS requestBuffer and the fill below WRITES it: order
+        // them (the copy's own trailing barrier only targets the HOST stage, so without
+        // this the reset could land first and the frame's node requests be lost)
+        this.ctx.barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         vkCmdFillBuffer(this.ctx.cmd(), this.requestBuffer.buffer, 0, 4, 0);
         //The download copy read the requestBuffer (TRANSFER read); the fill
         // resets it (TRANSFER write). The next reader is next frame's traversal

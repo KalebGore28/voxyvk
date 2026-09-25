@@ -1,8 +1,10 @@
 package me.cortex.voxy.client.mixin.vk;
 
 import com.mojang.blaze3d.vulkan.VulkanDevice;
+import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.client.core.vk.MinecraftVkHost;
 import me.cortex.voxy.client.core.vk.MinecraftVkHostAdapter;
+import me.cortex.voxy.client.core.vk.VulkanBackend;
 import me.cortex.voxy.common.Logger;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -32,8 +34,27 @@ public class MixinVulkanDevice {
         }
     }
 
+    //MC is about to destroy this VkDevice. Everything Voxy created on it must go
+    // first, while the device is still valid: the renderer (normally already shut
+    // down by LevelRenderer.close() on game exit), then the adopted context's own
+    // objects (command pool, pipeline cache, samplers, descriptor set layouts).
     @Inject(method = "close", at = @At("HEAD"))
     private void voxy$clearHost(CallbackInfo ci) {
-        MinecraftVkHost.clear();
+        if (MinecraftVkHost.get() instanceof MinecraftVkHostAdapter adapter && adapter.wraps((VulkanDevice) (Object) this)) {
+            try {
+                var holder = IVoxyRenderSystemHolder.getNullableHolder();
+                if (holder != null) {
+                    holder.voxy$shutdownRenderer();
+                }
+            } catch (Throwable t) {
+                Logger.error("Voxy: failed to shut down the renderer before the Vulkan device closed", t);
+            }
+            try {
+                VulkanBackend.shutdown();
+            } catch (Throwable t) {
+                Logger.error("Voxy: failed to release its Vulkan objects before the device closed", t);
+            }
+            MinecraftVkHost.clear();
+        }
     }
 }

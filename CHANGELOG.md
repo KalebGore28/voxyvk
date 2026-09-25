@@ -12,6 +12,25 @@ and this project uses versioning in the format `MAJOR.MINOR.PATCH+mcVERSION`.
 ### Changed
 - Updated documentation to clarify license restrictions (no binary redistribution)
 - Removed automated release workflow to comply with license
+- `lwjgl-vulkan` / `lwjgl-shaderc` are now compile-only (Minecraft 26.2 ships them); the mod jar no longer bundles its own copies
+- Vulkan renderer creation is deferred to the next frame boundary (so its block-atlas readback runs after Minecraft's pending GPU work, e.g. a resource reload)
+
+### Fixed (Vulkan backend, see `VULKAN_BUG_AUDIT_OPUS5.md`)
+- Minecraft's images are always `GENERAL`: Voxy no longer transitions MC's depth/colour/lightmap/block atlas to other layouts or leaves them there (VK-01)
+- Voxy asks Minecraft to enable the device features it uses (`shaderInt64`, `fragmentStoresAndAtomics`, `drawIndirectFirstInstance`, and `drawIndirectCount` when supported) and gates on what was actually enabled; the raster-cull vertex shader no longer declares a writable SSBO (VK-02)
+- Frame retirement uses a timeline semaphore signalled through Minecraft's encoder instead of `VkEvent`s (no portability-subset `events` dependency on MoltenVK) (VK-02)
+- Pipelines are destroyed only after the frames using them retire; teardown no longer destroys them while the GPU may still run them (VK-03)
+- Voxy's frame now ends with the full memory barrier Minecraft's command stream relies on (VK-04)
+- Subgroup capabilities are queried through `vkGetPhysicalDeviceProperties2`; the subgroup prefix sum race, the subgroup HiZ reduction (min/max under reverse-Z) and its coarse-level sizes are fixed; the traversal stays at the GL path's 32-wide groups (VK-05)
+- Stream-overflow recovery no longer treats the current, unsubmitted frame as complete (VK-06)
+- Barrier fixes: node-request readback vs reset, SSAO's compute read of MC depth, vertex-stage visibility of uploads (VK-07)
+- An exception mid-frame can no longer leave a rendering instance open in Minecraft's command buffer (VK-08)
+- A failed Vulkan renderer construction releases everything it created and clears its global singletons (VK-09)
+- Geometry buffer capacity respects `maxStorageBufferRange` / `maxMemoryAllocationSize`; failed allocations no longer leak handles (VK-10)
+- Voxy's Vulkan objects (command pool, pipeline cache, samplers, descriptor set layouts) are destroyed before Minecraft closes its device (VK-12)
+- Readbacks delivered during teardown are flushed before the node manager stops, and dropped (not leaked) after (VK-13)
+- Depth-stencil format is queried (D32S8, else D24S8) and the invalid mutable-format list is gone (VK-14)
+- Smaller fixes: exact-key descriptor set layout cache, guarded `#extension` lines stay guarded, `waitDiscard` discards, mip-count-aware model texture uploads, live-device backend detection (VK-15..VK-19)
 
 ## [0.2.18+mc26.2] - 2026-09-16
 

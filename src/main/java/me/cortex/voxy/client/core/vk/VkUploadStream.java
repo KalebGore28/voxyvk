@@ -18,8 +18,8 @@ import static org.lwjgl.vulkan.VK10.*;
 //Pure-VK implementation of the streaming upload contract: a persistently
 // mapped host-visible staging buffer + vkCmdCopyBuffer batches recorded into
 // the current frame commands at commit(). Staging space is recycled when the
-// frame that consumed it retires (VkFrameCtx events), mirroring the GL
-// fence-per-frame model 1:1.
+// frame that consumed it retires (VkFrameCtx's timeline semaphore), mirroring
+// the GL fence-per-frame model 1:1.
 public class VkUploadStream extends AbstractUploadStream {
     private final VkFrameCtx ctx;
     private final VkBuffer stagingBuffer;
@@ -118,8 +118,11 @@ public class VkUploadStream extends AbstractUploadStream {
             }
         }
         this.uploadList.clear();
+        //Destination stages must list VERTEX_SHADER explicitly: a barrier's access
+        // scope only covers the stages it names, and uploaded data (the terrain MVP
+        // UBO, geometry/model SSBOs) is read by vertex shaders
         this.ctx.barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
                 VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
         this.caddr = -1;
         this.offset = 0;

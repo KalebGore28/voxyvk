@@ -18,12 +18,12 @@ import static org.lwjgl.vulkan.VK10.*;
 // The whole pyramid lives in GENERAL layout (written as storage image, read as
 // sampled image by the traversal).
 //
-// When subgroup arithmetic is supported (MoltenVK/Metal, NVIDIA, AMD, Intel on
-// Vulkan 1.1+), levels 1..6 are collapsed into a SINGLE dispatch by the
-// subgroup reduce shader (hiz_subgroup.comp), cutting ~5 dispatches + 5
-// barriers per frame at 1080p. Level 0 still uses the per-level reduce (it
-// handles the non-power-of-two source/dest ratio). Any levels beyond 6 (for
-// pyramids larger than 64x64 base) fall back to the per-level loop.
+// When compute shaders support clustered subgroup ops (VulkanContext.
+// supportsSubgroupHiZ) and both base dimensions are >= 64, levels 1..6 are
+// collapsed into a SINGLE dispatch by the subgroup reduce shader
+// (hiz_subgroup.comp), cutting ~5 dispatches + 5 barriers per frame at 1080p.
+// Level 0 still uses the per-level reduce (it handles the non-power-of-two
+// source/dest ratio). Levels 7+ fall back to the per-level loop.
 public class VkHiZ {
     private final VkFrameCtx ctx;
     private final VkShaderPipeline reduce;
@@ -41,10 +41,11 @@ public class VkHiZ {
                 VkShaderSource.load("voxy:hiz/vk/hiz_reduce.comp", VkShaderSource.defs().props(properties).build()),
                 16,
                 List.of(VkShaderPipeline.sampler(0), VkShaderPipeline.image(1)));
-    //Subgroup reduce: 7 bindings (mip_0 sampler + mip_1..mip_6 storage images).
-    //Only built when the device supports subgroup arithmetic AND the pyramid
-    // will have >= 7 levels.
-        if (ctx.vk().subgroupArithmetic) {
+        //Subgroup reduce: 7 bindings (mip_0 sampler + mip_1..mip_6 storage images).
+        //Built when compute shaders support clustered subgroup ops (the shader uses
+        // subgroupClustered*, so ARITHMETIC alone is not enough); used per frame only
+        // when the pyramid is big enough (see buildMipChain).
+        if (ctx.vk().supportsSubgroupHiZ()) {
             this.subgroupReduce = new VkShaderPipeline(ctx, "hiz_subgroup.comp",
                     VkShaderSource.load("voxy:hiz/vk/hiz_subgroup.comp", VkShaderSource.defs().props(properties).build()),
                     16,
@@ -111,9 +112,10 @@ public class VkHiZ {
         ch = Math.max(ch / 2, 1);
 
         //Levels 1..6: single subgroup dispatch when available and pyramid has enough levels.
-        //The subgroup shader reduces 64x64 tiles of mip_0 to mip_1..mip_6 in one dispatch.
+        //The subgroup shader reduces whole 64x64 tiles of mip_0 to mip_1..mip_6, so BOTH
+        // dimensions must be >= 64 (e.g. a 1024x32 base would store outside mip_2..6).
         int subgroupEndLevel = 0;
-        if (this.subgroupReduce != null && this.levels >= 7) {
+        if (this.subgroupReduce != null && this.levels >= 7 && Math.min(this.width, this.height) >= 64) {
             this.subgroupReduce.bind(cmd);
             try (var binder = this.subgroupReduce.binder()) {
                 binder.sampler(0, this.pyramid.mipViews[0], this.sampler, VK_IMAGE_LAYOUT_GENERAL)
@@ -137,11 +139,13 @@ public class VkHiZ {
             this.ctx.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
             subgroupEndLevel = 6;
-            //Advance cw/ch past the subgroup-covered levels for any remaining per-level loop.
-            cw = Math.max(this.width >> 6, 1);
-            ch = Math.max(this.height >> 6, 1);
-            sw = Math.max(this.width >> 5, 1);
-            sh = Math.max(this.height >> 5, 1);
+            //The loop below continues at level 7: cw/ch must be level 7's size and
+            // sw/sh level 6's (the reduce derives its UVs from dstSize, so passing level
+            // 6's size here built each coarser level from a quarter of the one above)
+            cw = Math.max(this.width >> 7, 1);
+            ch = Math.max(this.height >> 7, 1);
+            sw = Math.max(this.width >> 6, 1);
+            sh = Math.max(this.height >> 6, 1);
         }
 
         //Remaining levels (7+): per-level reduce loop.

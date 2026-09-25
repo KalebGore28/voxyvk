@@ -366,7 +366,7 @@ public class ModelFactory {
                 this.biomeUpload = null;
             }
 
-            store.uploadModelTexture(this.modelId, this.texture);
+            store.uploadModelTexture(this.modelId, this.texture, this.hasMips ? LAYERS : 1);
 
             this.modelId = -1;
         }

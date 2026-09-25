@@ -76,12 +76,12 @@ public class ModelStore implements IModelStore {
     }
 
     @Override
-    public void uploadModelTexture(int modelId, me.cortex.voxy.common.util.MemoryBuffer texture) {
+    public void uploadModelTexture(int modelId, me.cortex.voxy.common.util.MemoryBuffer texture, int mipLevels) {
         final int TS = ModelFactory.MODEL_TEXTURE_SIZE;
         int X = (modelId&0xFF) * TS*3;
         int Y = ((modelId>>8)&0xFF) * TS*2;
         long cAddr = texture.address;
-        for (int lvl = 0; lvl < ModelFactory.LAYERS; lvl++) {
+        for (int lvl = 0; lvl < mipLevels; lvl++) {
             org.lwjgl.opengl.ARBDirectStateAccess.nglTextureSubImage2D(this.textures.id, lvl, X >> lvl, Y >> lvl,
                     (TS*3) >> lvl, (TS*2) >> lvl,
                     org.lwjgl.opengl.GL11.GL_RGBA, org.lwjgl.opengl.GL11.GL_UNSIGNED_BYTE, cAddr);

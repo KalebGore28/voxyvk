@@ -2,12 +2,10 @@ package me.cortex.voxy.client.core.vk;
 
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VkImageCreateInfo;
-import org.lwjgl.vulkan.VkImageFormatListCreateInfo;
 import org.lwjgl.vulkan.VkImageMemoryBarrier;
 import org.lwjgl.vulkan.VkImageViewCreateInfo;
 import org.lwjgl.vulkan.VkMemoryAllocateInfo;
 import org.lwjgl.vulkan.VkMemoryRequirements;
-import org.lwjgl.vulkan.VkSamplerCreateInfo;
 
 import static me.cortex.voxy.client.core.vk.VkUtil.check;
 import static org.lwjgl.system.MemoryStack.stackPush;
@@ -29,18 +27,12 @@ public final class VkImage2D {
     public final int aspect;
     private int currentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
+    //A depth-only sampling view of a depth+stencil image needs no mutable-format
+    // flag: it is created with the image's own format and ASPECT_DEPTH
+    // (createAspectView). Depth/stencil formats are only format-compatible with
+    // themselves, so listing e.g. D32_SFLOAT as a view format of D32_SFLOAT_S8_UINT
+    // (as this used to) is invalid.
     public VkImage2D(VkFrameCtx ctx, int width, int height, int mipLevels, int format, int usage, int aspect, boolean perMipViews) {
-        this(ctx, width, height, mipLevels, format, usage, aspect, perMipViews, null);
-    }
-
-    //Creates a 2D image with optional VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT + a
-    // VkImageFormatListCreateInfo listing the formats the image will be viewed
-    // as. Required for sampling a depth-only aspect of a packed D32_SFLOAT_S8_UINT
-    // image on MoltenVK (so the depth-only view aliases the image without a
-    // separate staging texture). viewFormats may be null (no mutable-format
-    // flag, classic path).
-    public VkImage2D(VkFrameCtx ctx, int width, int height, int mipLevels, int format, int usage, int aspect,
-                     boolean perMipViews, int[] viewFormats) {
         this.ctx = ctx;
         this.width = width;
         this.height = height;
@@ -59,31 +51,41 @@ public final class VkImage2D {
                     .usage(usage)
                     .sharingMode(VK_SHARING_MODE_EXCLUSIVE)
                     .initialLayout(VK_IMAGE_LAYOUT_UNDEFINED);
-            if (viewFormats != null && viewFormats.length > 0) {
-                ici.flags(VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT);
-                var formatList = VkImageFormatListCreateInfo.calloc(stack).sType$Default()
-                        .pViewFormats(stack.ints(viewFormats));
-                ici.pNext(formatList.address());
-            }
             var pImg = stack.mallocLong(1);
             check(vkCreateImage(vctx.device, ici, null, pImg), "vkCreateImage");
-            this.image = pImg.get(0);
+            long image = pImg.get(0);
+            long memory = VK_NULL_HANDLE;
+            var views = new java.util.ArrayList<Long>();
+            try {
+                var req = VkMemoryRequirements.calloc(stack);
+                vkGetImageMemoryRequirements(vctx.device, image, req);
+                var mai = VkMemoryAllocateInfo.calloc(stack).sType$Default()
+                        .allocationSize(req.size())
+                        .memoryTypeIndex(vctx.findMemoryType(req.memoryTypeBits(), VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
+                var pMem = stack.mallocLong(1);
+                check(vkAllocateMemory(vctx.device, mai, null, pMem), "vkAllocateMemory(image)");
+                memory = pMem.get(0);
+                check(vkBindImageMemory(vctx.device, image, memory, 0), "vkBindImageMemory");
 
-            var req = VkMemoryRequirements.calloc(stack);
-            vkGetImageMemoryRequirements(vctx.device, this.image, req);
-            var mai = VkMemoryAllocateInfo.calloc(stack).sType$Default()
-                    .allocationSize(req.size())
-                    .memoryTypeIndex(vctx.findMemoryType(req.memoryTypeBits(), VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
-            var pMem = stack.mallocLong(1);
-            check(vkAllocateMemory(vctx.device, mai, null, pMem), "vkAllocateMemory(image)");
-            this.memory = pMem.get(0);
-            check(vkBindImageMemory(vctx.device, this.image, this.memory, 0), "vkBindImageMemory");
-
-            this.view = createView(stack, vctx, 0, mipLevels);
+                views.add(createView(stack, vctx, image, format, aspect, 0, mipLevels));
+                if (perMipViews) {
+                    for (int i = 0; i < mipLevels; i++) {
+                        views.add(createView(stack, vctx, image, format, aspect, i, 1));
+                    }
+                }
+            } catch (RuntimeException e) {
+                for (long v : views) vkDestroyImageView(vctx.device, v, null);
+                if (memory != VK_NULL_HANDLE) vkFreeMemory(vctx.device, memory, null);
+                vkDestroyImage(vctx.device, image, null);
+                throw e;
+            }
+            this.image = image;
+            this.memory = memory;
+            this.view = views.get(0);
             if (perMipViews) {
                 this.mipViews = new long[mipLevels];
                 for (int i = 0; i < mipLevels; i++) {
-                    this.mipViews[i] = createView(stack, vctx, i, 1);
+                    this.mipViews[i] = views.get(i + 1);
                 }
             } else {
                 this.mipViews = null;
@@ -91,10 +93,10 @@ public final class VkImage2D {
         }
     }
 
-    private long createView(MemoryStack stack, VulkanContext vctx, int baseMip, int mipCount) {
+    private static long createView(MemoryStack stack, VulkanContext vctx, long image, int format, int aspect, int baseMip, int mipCount) {
         var vci = VkImageViewCreateInfo.calloc(stack).sType$Default()
-                .image(this.image).viewType(VK_IMAGE_VIEW_TYPE_2D).format(this.format);
-        vci.subresourceRange().aspectMask(this.aspect).baseMipLevel(baseMip).levelCount(mipCount).baseArrayLayer(0).layerCount(1);
+                .image(image).viewType(VK_IMAGE_VIEW_TYPE_2D).format(format);
+        vci.subresourceRange().aspectMask(aspect).baseMipLevel(baseMip).levelCount(mipCount).baseArrayLayer(0).layerCount(1);
         var pView = stack.mallocLong(1);
         check(vkCreateImageView(vctx.device, vci, null, pView), "vkCreateImageView");
         return pView.get(0);
@@ -169,27 +171,9 @@ public final class VkImage2D {
     }
 
     /** Simple sampler factory (nearest/clamped or nearest-mipmap for HiZ etc).
-     *  Cached by (mipmapNearest, linear) so the ~9 call sites across the renderer
-     *  share ~4 sampler handles instead of creating one each. */
-    private static final java.util.Map<Long, Long> SAMPLER_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+     *  Shared per (mipmapNearest, linear) and owned by the VulkanContext, which
+     *  destroys them with the rest of its objects before MC destroys the device. */
     public static long createSampler(VulkanContext ctx, boolean mipmapNearest, boolean linear) {
-        long key = ctx.device.address() ^ (mipmapNearest ? 1L : 0L) ^ (linear ? 2L : 0L);
-        Long cached = SAMPLER_CACHE.get(key);
-        if (cached != null) return cached;
-        try (MemoryStack stack = stackPush()) {
-            var sci = VkSamplerCreateInfo.calloc(stack).sType$Default()
-                    .magFilter(linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST)
-                    .minFilter(linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST)
-                    .mipmapMode(VK_SAMPLER_MIPMAP_MODE_NEAREST)
-                    .addressModeU(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
-                    .addressModeV(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
-                    .addressModeW(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
-                    .minLod(0).maxLod(mipmapNearest ? VK_LOD_CLAMP_NONE : 0.25f);
-            var pSampler = stack.mallocLong(1);
-            check(vkCreateSampler(ctx.device, sci, null, pSampler), "vkCreateSampler");
-            long handle = pSampler.get(0);
-            SAMPLER_CACHE.put(key, handle);
-            return handle;
-        }
+        return ctx.sampler(mipmapNearest, linear);
     }
 }

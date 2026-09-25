@@ -10,11 +10,18 @@ import static org.lwjgl.util.shaderc.Shaderc.*;
  * Runtime GLSL -> SPIR-V so Voxy's shaders stay single-source. Compiles the
  * SAME .glsl assets the GL path uses, with VOXY_VULKAN defined and vulkan
  * semantics enabled (auto bind/set mapping for the existing layout(binding=N)
- * declarations). Requires the lwjgl-shaderc natives added in build.gradle.
+ * declarations). lwjgl-shaderc (+ natives) ships with Minecraft 26.2 itself.
  */
 public final class ShadercCompiler {
-    public static ByteBuffer compile(String source, ShaderType type, String name) {
-        long compiler = shaderc_compiler_initialize();
+    //One compiler for the process lifetime: initializing a shaderc compiler sets up
+    // glslang each time, which used to happen for every one of the ~20 shaders
+    private static long compiler;
+
+    public static synchronized ByteBuffer compile(String source, ShaderType type, String name) {
+        if (compiler == 0) {
+            compiler = shaderc_compiler_initialize();
+            if (compiler == 0) throw new IllegalStateException("shaderc_compiler_initialize failed");
+        }
         long options = shaderc_compile_options_initialize();
         try {
             shaderc_compile_options_set_target_env(options, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_2);
@@ -42,7 +49,6 @@ public final class ShadercCompiler {
             }
         } finally {
             shaderc_compile_options_release(options);
-            shaderc_compiler_release(compiler);
         }
     }
     private ShadercCompiler() {}

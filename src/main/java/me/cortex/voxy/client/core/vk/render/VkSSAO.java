@@ -24,7 +24,7 @@ import static org.lwjgl.vulkan.VK10.*;
 // (LOD present) / 0 (empty), which is what the composite blend expects.
 //
 // The BETTER/BEST modes additionally sample MC's own depth attachment (for AO
-// across the vanilla/LOD seam), transitioned around the dispatch. AUTO mode is
+// across the vanilla/LOD seam), in place in MC's GENERAL layout. AUTO mode is
 // resolved from the device-local heap size (VK always exposes heap sizes,
 // unlike the GL Capabilities memory query).
 public class VkSSAO {
@@ -142,8 +142,12 @@ public class VkSSAO {
                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
         if (this.isBetterSSAO) {
-            VkFrameHost.transitionMcImage(cmd, rt.mcDepth(), true,
-                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            //MC's depth is read by this COMPUTE dispatch, in place (MC_IMAGE_LAYOUT).
+            // The dependency must target the compute stage; the old fragment-stage
+            // transition left the read unordered against the layout change.
+            VkFrameHost.mcImageBarrier(cmd, rt.mcDepth(), true,
+                    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
         }
 
         this.pipeline.bind(cmd);
@@ -152,16 +156,14 @@ public class VkSSAO {
                     .sampler(1, viewport.colour.view, this.colourSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
                     .sampler(2, viewport.depthSampleView, this.depthSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             if (this.isBetterSSAO) {
-                b.sampler(3, VkFrameHost.vkView(rt.mcDepth()), this.depthSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                b.sampler(3, VkFrameHost.vkView(rt.mcDepth()), this.depthSampler, VkFrameHost.MC_IMAGE_LAYOUT);
             }
             b.ubo(4, this.params).push(cmd);
         }
         vkCmdDispatch(cmd, (viewport.width + 7) / 8, (viewport.height + 7) / 8, 1);
+        //(MC's depth needs no transition back; the composite orders its depth writes
+        // after this compute read)
 
-        if (this.isBetterSSAO) {
-            VkFrameHost.transitionMcImage(cmd, rt.mcDepth(), true,
-                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-        }
         //SSAO output -> colour attachment for the translucent pass
         viewport.colourSSAO.transition(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,

@@ -371,16 +371,15 @@ jar {
 
 project.ext.lwjglVersion = "3.4.1"
 
-// --- Voxy Vulkan backend deps (optional at runtime; probed via capability detection) ---
+// --- Voxy Vulkan backend deps ---
+// Compile-only: Minecraft 26.2 itself ships lwjgl-vulkan (incl. MoltenVK on macOS)
+// and lwjgl-shaderc, with natives for every platform, at the same LWJGL version.
+// Bundling our own copies (Jar-in-Jar) was redundant and would skew module versions
+// as soon as Mojang bumps LWJGL. Voxy's Vulkan path only runs when MC's own Vulkan
+// backend is active, i.e. when these are guaranteed to be on the classpath.
 dependencies {
-    include(implementation("org.lwjgl:lwjgl-vulkan:${project.ext.lwjglVersion}"))
-    include(implementation("org.lwjgl:lwjgl-shaderc:${project.ext.lwjglVersion}"))
-    for (n in ["natives-windows", "natives-linux", "natives-macos", "natives-macos-arm64"]) {
-        include(runtimeOnly("org.lwjgl:lwjgl-shaderc:${project.ext.lwjglVersion}:${n}"))
-    }
-    // MoltenVK translation layer path on macOS is provided by lwjgl-vulkan natives there:
-    include(runtimeOnly("org.lwjgl:lwjgl-vulkan:${project.ext.lwjglVersion}:natives-macos"))
-    include(runtimeOnly("org.lwjgl:lwjgl-vulkan:${project.ext.lwjglVersion}:natives-macos-arm64"))
+    compileOnly("org.lwjgl:lwjgl-vulkan:${project.ext.lwjglVersion}")
+    compileOnly("org.lwjgl:lwjgl-shaderc:${project.ext.lwjglVersion}")
 }
 project.ext.lwjglNatives = "natives-windows"
 

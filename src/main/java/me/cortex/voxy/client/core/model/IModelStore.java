@@ -16,9 +16,10 @@ public interface IModelStore {
     void beginTextureUploads();
 
     //Upload one baked model's mip chain into its atlas slot. Layout of texture:
-    // LAYERS consecutive RGBA8 mip images of a (MODEL_TEXTURE_SIZE*3 x
-    // MODEL_TEXTURE_SIZE*2) tile, tightly packed.
-    void uploadModelTexture(int modelId, MemoryBuffer texture);
+    // mipLevels (1..LAYERS) consecutive RGBA8 mip images of a
+    // (MODEL_TEXTURE_SIZE*3 x MODEL_TEXTURE_SIZE*2) tile, tightly packed. A texture
+    // baked without mips holds ONLY level 0, so implementations must not read more.
+    void uploadModelTexture(int modelId, MemoryBuffer texture, int mipLevels);
 
     /** Called once after a batch of texture uploads (VK: transition back to sampled). */
     void endTextureUploads();

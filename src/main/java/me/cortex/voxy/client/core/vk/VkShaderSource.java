@@ -4,6 +4,7 @@ import me.cortex.voxy.client.core.gl.shader.ShaderLoader;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 //Loads a Voxy shader asset for the Vulkan backend: expands #imports via the
 // shared ShaderLoader, forces a Vulkan-capable #version, and injects #defines
@@ -13,13 +14,23 @@ import java.util.Map;
 public final class VkShaderSource {
     //Shader printf debugging is a GL-path feature (PrintfInjector rewrites the calls);
     // on VK the statements are stripped so the shared sources stay single-source.
-    private static final java.util.regex.Pattern PRINTF = java.util.regex.Pattern.compile("printf\\s*\\([^;]*?\\)\\s*;", java.util.regex.Pattern.DOTALL);
+    private static final Pattern PRINTF = Pattern.compile("printf\\s*\\([^;]*?\\)\\s*;", Pattern.DOTALL);
+    private static final Pattern EXTENSION = Pattern.compile("^#\\s*extension\\b");
+    private static final Pattern CONDITIONAL_OPEN = Pattern.compile("^#\\s*if(n?def)?\\b");
+    private static final Pattern CONDITIONAL_CLOSE = Pattern.compile("^#\\s*endif\\b");
 
     public static String load(String id, Map<String, String> defines) {
-        String src = PRINTF.matcher(ShaderLoader.parse(id)).replaceAll("");
+        return assemble(ShaderLoader.parse(id), defines);
+    }
+
+    //Pure text transform of an import-expanded source (separate from load() so it can
+    // be exercised without Minecraft's resource classes).
+    public static String assemble(String parsedSource, Map<String, String> defines) {
+        String src = PRINTF.matcher(parsedSource).replaceAll("");
         StringBuilder header = new StringBuilder();
         StringBuilder body = new StringBuilder();
         boolean versionDone = false;
+        int conditionalDepth = 0;
         for (String line : src.split("\n", -1)) {
             String trimmed = line.trim();
             if (!versionDone && trimmed.startsWith("#version")) {
@@ -28,9 +39,22 @@ public final class VkShaderSource {
                 versionDone = true;
                 continue;
             }
-            if (!versionDone || trimmed.startsWith("#extension")) {
+            if (!versionDone) {
                 header.append(line).append('\n');
                 continue;
+            }
+            //Only UNCONDITIONAL #extension lines are hoisted into the header (import
+            // expansion can leave them after code, where GLSL rejects them). One inside
+            // #if/#ifdef stays where it is so its guard still applies: hoisting made e.g.
+            // quads.frag's NV-only barycentric extension unconditional.
+            if (conditionalDepth == 0 && EXTENSION.matcher(trimmed).find()) {
+                header.append(line).append('\n');
+                continue;
+            }
+            if (CONDITIONAL_OPEN.matcher(trimmed).find()) {
+                conditionalDepth++;
+            } else if (CONDITIONAL_CLOSE.matcher(trimmed).find()) {
+                conditionalDepth = Math.max(0, conditionalDepth - 1);
             }
             body.append(line).append('\n');
         }
