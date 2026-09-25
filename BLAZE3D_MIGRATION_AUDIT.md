@@ -40,6 +40,28 @@ Goal of the plan: make future Minecraft ports cheaper by leaning on Blaze3D wher
 
 ---
 
+## Progress
+
+Work happens on the branch `blaze3d-migration`, off `vulkan-audit-fixes`. Sections 2–4 and Appendix A describe the code as audited at `ee85c6f8`; this table lists what has changed since.
+
+| Step | Status | Commit |
+|---|---|---|
+| 2.3 Async atlas readback via Blaze3D | Done, needs in-game testing | `1ce62302` |
+| 0.1 Blaze3D-VK classes only in `MinecraftVkHostAdapter` + `mixin/vk` | Done | `6fc22f19` |
+| 0.2 Contracts D1–D11 on `IVkHost`; D5 checked at device creation | Done | `b81829ec` |
+| 1.1 Frame spliced in with `execute()`; `AccessorVulkanCommandEncoder` deleted | Done, needs in-game testing | `16678071` |
+| 1.2 Frame retirement through `GpuFence` | Next | |
+| 1.3 MC's destruction queue for deferred destroys | Next | |
+| 1.4 Allocations through MC's VMA | Next | |
+
+In-game checks for the finished steps:
+- VK (Prefer Vulkan), with `--vulkanValidation` if the validation layer is installed.
+- The built jar in the Modrinth App on the M2 Max.
+- World join/leave twice, and a resource-pack reload (F3+T). LODs should appear a frame or two after joining or reloading, with correct block textures.
+- A GL (Default) regression check.
+
+---
+
 ## 1. How this was checked (and how to re-check)
 
 - Read all 35 files under `client/core/vk/**` and `client/mixin/vk/**`, the backend-neutral seams (`IDeviceBuffer`, `IModelStore`, `INodeGpuOps`, `IAtlasTextureReader`, `Abstract{Upload,Download}Stream`, …), `VoxyRenderSystem`, `RenderProperties`, and every mixin's target.
@@ -253,7 +275,8 @@ Every step should land on its own (build, test, commit). Verify each step on:
 
 ### Phase 0 — Fence off and document (no behaviour change)
 
-**0.1 Route every Blaze3D-VK internal through the host seam**
+**0.1 Route every Blaze3D-VK internal through the host seam — ✅ done (`6fc22f19`)**
+- *As built:* `IVkHost` gained `vkImage`/`vkImageView`/`vkFormat`, and the feature request moved to `MinecraftVkHostAdapter.requestDeviceFeatures`. `vma()` and `vkSampler()` come with 1.4/1.5.
 - *Goal:* a version port touches one adapter file plus the vk mixins, and nothing else.
 - *How:*
   - Extend `IVkHost` with `long vkImage(GpuTexture)`, `long vkImageView(GpuTextureView)`, `int vkFormat(GpuFormat)`, `long vkSampler(GpuSampler)`, `long vma()`, `VkCommandBuffer beginSegment()`/`endSegment(cb)` (for 1.1), and a `lightmapView()` accessor.
@@ -262,7 +285,8 @@ Every step should land on its own (build, test, commit). Verify each step on:
   - Move the `VulkanFeature` / `VulkanBackend.*_FEATURES_STRUCT` references from `VkDeviceFeatures.java` into the mixin or adapter, leaving `VkDeviceFeatures` a plain record of what got enabled.
 - *Done when:* `grep -rl "com.mojang.blaze3d.vulkan" src/main/java` lists only `MinecraftVkHostAdapter` and `mixin/vk/*`.
 
-**0.2 Write the contracts down and assert the cheap ones**
+**0.2 Write the contracts down and assert the cheap ones — ✅ done (`b81829ec`)**
+- *As built:* the D5 check runs in the device-creation hook instead of through `DeviceInfo`. It records whether MC's extension list and feature set contain `VK_KHR_push_descriptor`, dynamic rendering and timeline semaphores, and `VkDeviceFeatures.missingRequired()` reports any that are missing. `isZZeroToOne()` isn't asserted, because `RenderProperties` handles both depth ranges.
 - *Goal:* a port can't silently violate D1–D11.
 - *How:*
   - Copy the §2.3 table into `IVkHost`'s header comment.
@@ -273,7 +297,8 @@ Every step should land on its own (build, test, commit). Verify each step on:
 
 ### Phase 1 — Swap private hooks for the public ones MC itself uses (VK)
 
-**1.1 Record Voxy's frame into its own command buffers, spliced in with `execute()`**
+**1.1 Record Voxy's frame into its own command buffers, spliced in with `execute()` — ✅ done (`16678071`)**
+- *As built:* one segment per frame, through `IVkHost.beginSegment()/endSegment()`. Voxy's frame makes no Blaze3D encoder calls yet, so gotcha (a) below only matters once Phase 4 mixes in Blaze3D passes.
 - *Goal:* delete `AccessorVulkanCommandEncoder`, the only private-field accessor.
 - *How:*
   - A frame becomes one or more *segments*: `cb = encoder.allocateAndBeginTransientCommandBuffer()` → record → `vkEndCommandBuffer(cb)` → `encoder.execute(cb)`. This is exactly how MC's `VulkanTransientMemory` and `VulkanGpuSurface` inject work.
@@ -318,7 +343,8 @@ Every step should land on its own (build, test, commit). Verify each step on:
 
 **2.2 Vendor/limits from `DeviceInfo` (only where VK needs it).** Where the VK path needs vendor or limits, use `DeviceInfo.vendorName()/name()/type()/limits()` instead of the GL-only `Capabilities`. Leave GL's `Capabilities` probes untouched.
 
-**2.3 Asynchronous atlas readback via Blaze3D — approved (Decisions)**
+**2.3 Asynchronous atlas readback via Blaze3D — ✅ done (`1ce62302`); the follow-up below is still open**
+- *As built:* `IAtlasTextureReader.readAsync` and `Blaze3DAtlasTextureReader`. `ModelBakerySubsystem` starts the readback before its processing thread starts, and `ModelFactory.processAllThings()` waits for `SoftwareModelTextureBakery.isTextureReady()`. Deferred renderer creation stays for now: it also guarantees no MC render pass is open when the copy is recorded.
 - *What it's for:* the model bakery's software rasterizer samples MC's block atlas (`minecraft:textures/atlas/blocks.png`, RGBA8) from a CPU copy, via `SoftwareModelTextureBakery.setupTexture()` → `IAtlasTextureReader`. The copy is taken once per renderer creation (world join, resource reload).
 - *Today it's synchronous on both backends:*
   - GL: `glFinish()` + `glGetTextureImage`.
@@ -450,13 +476,12 @@ grep -n "pushConstant\|PushConstant" -r $B/pipeline $B/systems
 
 1. `./gradlew genSources`, then extract `com/mojang/blaze3d` ([§1](#1-how-this-was-checked-and-how-to-re-check)).
 2. **Tier C hooks.** Confirm that the following still exist with the same shape; mismatches crash the game (`defaultRequire: 1`), except `MixinVulkanBackend`:
-   - `VulkanCommandEncoder.currentCommandBuffer` (until 1.1 removes it)
    - `VulkanBackend.createDevice(Collection, VulkanPhysicalDevice, Set)`
    - `VulkanDevice.<init>` / `close`
    - `Minecraft.renderFrame`
    - Sodium `SodiumWorldRenderer.drawChunkLayer(ChunkSectionLayerGroup, ChunkRenderMatrices, double, double, double, GpuSampler)`, and on the GL path `DefaultChunkRenderer.render`
 3. **Tier B getters.** Confirm `VulkanDevice.{instance,vkDevice,graphicsQueue,createCommandEncoder,vma}`, `VulkanCommandEncoder.{signalSemaphore,execute,allocateAndBeginTransientCommandBuffer,queueForDestroy}`, `VulkanGpuTexture.vkImage`, `VulkanGpuTextureView.vkImageView`, `VulkanGpuSampler.vkSampler`, `VulkanConst.toVk(GpuFormat)`, `VulkanFeature`, and `VulkanBackend.VK10/VK12_FEATURES_STRUCT`.
-4. **Tier D contracts.** Re-read the code behind D1–D11:
+4. **Tier D contracts.** D5 is checked automatically at device creation; if the log says *"Minecraft's Vulkan device lacks features Voxy requires"*, start there. Re-read the code behind the rest (the list is on `IVkHost`):
    - `VulkanGpuTexture` constructor (layout)
    - `VulkanCommandEncoder.memoryBarrier` and its callers
    - `VulkanCommandEncoder.submit` (in-flight count)
@@ -490,7 +515,7 @@ Two questions are already settled (see [Decisions](#decisions-2026-09-25)): GL i
 |---|---|---|---|---|
 | `core/vk/IVkHost.java` | 34 | — | host seam | 0.1 |
 | `core/vk/MinecraftVkHost.java` | 38 | `RenderSystem.tryGetDevice` (A) | detects MC-on-Vulkan | — |
-| `core/vk/MinecraftVkHostAdapter.java` | 53 | `VulkanDevice`, `VulkanCommandEncoder` (B, C) | handles, frame cmd, semaphore signal | 0.1, 1.1, 1.2 |
+| `core/vk/MinecraftVkHostAdapter.java` | 53 | `VulkanDevice`, `VulkanCommandEncoder` (B, C) | handles, frame cmd, semaphore signal | 0.1 ✅, 1.1 ✅, 1.2 (now also holds the feature request and handle lookups) |
 | `core/vk/VulkanBackend.java` | 71 | — | adoption lifecycle | — |
 | `core/vk/VulkanContext.java` | 238 | — | caps (subgroups, limits, formats), cmd pool, pipeline cache, samplers, set-layout cache, memory types | 1.4, 1.5 |
 | `core/vk/VkDeviceFeatures.java` | 97 | `VulkanFeature`, `VulkanBackend` statics (B) | extra feature request/record | 0.1 |
@@ -502,7 +527,7 @@ Two questions are already settled (see [Decisions](#decisions-2026-09-25)): GL i
 | `core/vk/VkShaderSource.java` | 98 | — | `#import` expansion, version forcing, define injection | stays |
 | `core/vk/VkUploadStream.java` | 167 | — | persistently mapped staging + arena | 1.2 |
 | `core/vk/VkDownloadStream.java` | 185 | — | readback arena + callbacks | 1.2 |
-| `core/vk/VkAtlasTextureReader.java` | 72 | `GpuTexture` (A), `VulkanGpuTexture` (B) | image→buffer copy + immediate submit | 0.1, 2.3 |
+| `core/vk/VkAtlasTextureReader.java` | 72 | `GpuTexture` (A), `VulkanGpuTexture` (B) | image→buffer copy + immediate submit | deleted in 2.3 ✅ (now `core/model/bakery/Blaze3DAtlasTextureReader.java`, public API only) |
 | `core/vk/VkCmd.java`, `VkUtil.java` | 42, 13 | — | helpers | — |
 | `core/vk/render/VkRenderCore.java` | 390 | `RenderTarget` (A) | orchestration, resource ownership | 1.1 |
 | `core/vk/render/VkFrameHost.java` | 63 | `GpuTextureView` (A); `VulkanGpuTexture/View`, `VulkanConst` (B) | MC handle extraction, barriers on MC images | 0.1, 4.2 |
@@ -517,7 +542,7 @@ Two questions are already settled (see [Decisions](#decisions-2026-09-25)): GL i
 | `core/vk/render/VkModelStore.java` | 134 | — | model/colour SSBOs + atlas upload | 3.1 |
 | `core/vk/render/VkViewport.java` | 113 | — | per-viewport buffers + offscreen targets | 3.2 |
 | `core/vk/render/VkSectionGeometryData.java` | 94 | — | geometry + metadata buffers | 1.4 |
-| `mixin/vk/AccessorVulkanCommandEncoder.java` | 16 | private field (C) | — | delete in 1.1 |
+| `mixin/vk/AccessorVulkanCommandEncoder.java` | 16 | private field (C) | — | deleted in 1.1 ✅ |
 | `mixin/vk/MixinVulkanBackend.java` | 35 | private method (C) | feature request | 0.1 (keep) |
 | `mixin/vk/MixinVulkanDevice.java` | 60 | ctor/close (C) | host register/teardown | keep |
 | `mixin/vk/MixinMinecraftFrameStart.java` | 30 | `Minecraft.renderFrame` | deferred renderer creation | keep |
