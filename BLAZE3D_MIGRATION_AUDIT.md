@@ -58,8 +58,9 @@ Work happens on the branch `blaze3d-migration`, off `vulkan-audit-fixes`. Everyt
 | 2.1 GPU timing on Blaze3D queries | Done, tested in-game (see below); F3 layout reworked in `1fb6a3a3` | `6dac2b9b` |
 | 2.2 Name and limits from `DeviceInfo` | Done, tested in-game | `c09df914` |
 | 2.3 follow-up: drop deferred VK renderer creation | Decided: keep it (see [2.3](#phase-2--small-pieces-onto-the-public-blaze3d-api-vk-first)) | |
+| 4.1 Chunk-bounds pass on Blaze3D (with 3.2 for the depth-bound target) | Done, needs in-game testing (0.2.23) | `9a06f6d2` |
 | 1.5 (optional) Samplers from Blaze3D | Not started; do it together with 3.1, which touches the atlas sampler anyway | |
-| Phase 3 onwards | Not started | |
+| 3.1, 3.2 for the other targets, 4.2, Phase 5 | Not started | |
 
 In-game checks for the finished steps:
 - VK (Prefer Vulkan), with `--vulkanValidation` if the validation layer is installed.
@@ -86,6 +87,12 @@ Tested 2026-09-25 (jar `c09df91`, M2 Max, 4112×2580 window, singleplayer and th
 - The one-line F3 layout ran under the right column and hid the total. `1fb6a3a3` puts the total first and wraps the passes onto two more lines.
 
 Tested 2026-09-25 (jar `e299f3c`): an F3+T reload on the server rebuilt the renderer. LODs streamed back in with correct block textures, so the async atlas readback (2.3) holds up after a reload too. While everything reloads, the temporal pass shows a few shortfalls (`T short 8`): freshly loaded sections are all "new", but nothing was on screen there yet. GL regression checks can't run on the M2 Max (Voxy's GL path needs OpenGL 4.6; macOS stops at 4.1), so shared-code changes rely on compiling and review unless a Windows/Linux machine is available.
+
+What to watch for with 4.1 (jar `0.2.23+mc26.2`):
+- The log must not show *"Couldn't compile pipeline voxy:pipeline/chunk_bounds"* (Minecraft) or *"the chunk-bounds pipeline failed to compile"* (Voxy), nor *"Voxy VK frame failed"*.
+- Where vanilla chunks meet the LODs, LODs must stay out of the area vanilla chunks cover. If the pass stopped working, coarse LOD terrain would poke up through loaded chunks, most visibly over water, ravines and cliffs near the edge of the vanilla render distance.
+- F3 GpuTime lists `bounds` first now. Compare the frame total with the 0.2.22 baseline in the same spot.
+- Resizing the window recreates the depth-bound textures; F3+T and rejoining recompile the pipeline.
 
 What to watch for with 2.1 and 2.2:
 - **2.1:** set F3's `voxy:gpu_debug` entry to "In F3" (F3+F6 opens the debug options). About a second later F3 shows `GpuTime: [setup:…, bounds:…, RO:…, hiz:…, I:…, prep:…, OT:…, CG:…, TS:…, TP:…, ao:…, RT:…, comp:…, dyn:…] = total ms, worst …`. LODs must look the same with the line on and off, because the line splits Voxy's frame into one command buffer per section. If the log shows *"GPU timing marker inside a rendering instance"*, a marker sits inside a pass. On MoltenVK the times are approximate: Metal samples timestamps at encoder boundaries.
@@ -172,7 +179,7 @@ mkdir -p /tmp/mc-src && unzip -o -q "$(ls .gradle/loom-cache/minecraftMaven/net/
 | Textures — `createTexture` / `createTextureView(tex, baseMip, count)` | 2D, mips, cubemaps; usages `COPY_DST, COPY_SRC, TEXTURE_BINDING, RENDER_ATTACHMENT, CUBEMAP_COMPATIBLE`; formats incl. `D32_FLOAT`, `D32_FLOAT_S8_UINT`, `D24_UNORM_S8_UINT`, `R32_FLOAT`, `RGBA8_UNORM` | **no storage-image usage**; `depthOrLayers > 1` throws *"Array or 3D textures are not yet supported"* |
 | Samplers — `createSampler`, `RenderSystem.getSamplerCache()` | address/filter modes, anisotropy, `maxLod` | mip mode is derived (`maxLod > 0.25 ⇒ LINEAR`), so no *nearest-mip over a full chain* (needed by HiZ) |
 | Pipelines — `RenderPipeline.builder()` | vertex + fragment; defines; `BindGroupLayout` (named samplers, `UNIFORM_BUFFER`, `TEXEL_BUFFER`); ≤8 `ColorTargetState` (format, blend, write mask); `DepthStencilState(compare, write, biasScale, biasConst)`; cull; polygon mode; topologies incl. `TRIANGLE_STRIP`; `VertexFormat.builder(stepRate)` (instancing) | **`ShaderType` = VERTEX, FRAGMENT only (no compute)**; **no stencil**; **no push constants**; no SSBO/storage-image bindings |
-| Render passes — `CommandEncoder.createRenderPass(RenderPassDescriptor)` | N colour + optional depth, clears, render area, `withUnusedColorAttachment()`; `setPipeline`, `bindTexture(name, view, sampler)`, `setUniform(name, buffer)`, vertex/index buffers, `draw/drawIndexed/multiDraw*`, **`drawIndirect` / `drawIndexedIndirect`** (buffer needs `USAGE_INDIRECT_PARAMETERS`), scissor, debug groups, `writeTimestamp` | **no indirect-count**, no dispatch |
+| Render passes — `CommandEncoder.createRenderPass(RenderPassDescriptor)` | N colour + optional depth, clears, render area, `withUnusedColorAttachment()`; `setPipeline`, `bindTexture(name, view, sampler)`, `setUniform(name, buffer)`, vertex/index buffers, `draw/drawIndexed/multiDraw*`, **`drawIndirect` / `drawIndexedIndirect`** (buffer needs `USAGE_INDIRECT_PARAMETERS`), scissor, debug groups, `writeTimestamp` | **no indirect-count**, no dispatch; **no depth-only passes** (see 4.1) |
 | Transfers | `writeToBuffer`, `copyToBuffer`, `writeToTexture` (per mip/region), `copyBufferToTexture`, `copyTextureToBuffer(+callback)`, `copyTextureToTexture`, clears | copies can only target Blaze3D objects |
 | Sync | `createFence()` → `GpuFence.awaitCompletion(t)`; `RenderSystem.queueFencedTask(Runnable)` (drained by MC every frame in `RenderSystem.executePendingTasks()`) | no user barriers (the backend inserts its own) |
 | Timing | `GpuDevice.createTimestampQueryPool(n)`, `CommandEncoder/RenderPass.writeTimestamp`, `GpuQueryPool.getValue`, `DeviceInfo.timestampPeriod()`, `TimerQuery` | — |
@@ -482,7 +489,7 @@ Every step should land on its own (build, test, commit). Verify each step on:
   - Uploads go through MC's per-submit `TransientMemory`, so check peak per-frame upload size during heavy baking.
 - *Gotcha:* the texture's init barrier is recorded into MC's current buffer at creation, so create it outside a Voxy segment (1.1).
 
-**3.2 Depth-bound and main colour targets as `GpuTexture`s**
+**3.2 Depth-bound and main colour targets as `GpuTexture`s — depth-bound ✅ done with 4.1 (`9a06f6d2`); colour not started (needed by 4.2)**
 - *How:*
   - `depthBound`: `D32_FLOAT`, `RENDER_ATTACHMENT|TEXTURE_BINDING`.
   - `colour`: `RGBA8_UNORM`, `RENDER_ATTACHMENT|TEXTURE_BINDING`.
@@ -492,7 +499,20 @@ Every step should land on its own (build, test, commit). Verify each step on:
 
 ### Phase 4 — Blaze3D render passes
 
-**4.1 Pilot: chunk-bounds renderer as a Blaze3D pass**
+**4.1 Pilot: chunk-bounds renderer as a Blaze3D pass — ✅ done (`9a06f6d2`, 0.2.23)**
+- *As built:* `core/vk/render/Blaze3DBoundRenderer.java` replaces `VkBoundRenderer`, using the public API only.
+  - Shaders `assets/voxy/shaders/core/chunk_bounds.vsh/.fsh` (`#version 450`, no explicit bindings or locations, named block `VoxyChunkBounds`, per-instance `in ivec2 ChunkPos` as `RG32_SINT` with step rate 1). `CLOSER_SIGN` is a pipeline define.
+  - One `RenderPipeline` per depth direction, held statically: Blaze3D caches each pipeline object's compiled form until a resource reload, so one per renderer would pile up.
+  - Uniforms and instance positions go into `CommandEncoder.transientMemory().allocateGpuMapped(...)` each frame: CPU writes, no copy commands to order. The positions come from `StreamedBoundStore.packedPositions()`; on VK the store's device buffer is a placeholder.
+  - The depth-bound target is a Blaze3D `D32_FLOAT` texture (3.2 for this target). The terrain shaders sample it raw through `IVkHost.vkImageView` in `GENERAL`.
+  - The pass runs first in Voxy's frame, while Voxy's command buffer is still empty, so it lands before it without a split. `VkFrameCtx.blaze3d()` handles Blaze3D work later in a frame: it ends Voxy's buffer with the D2 full barrier, splices it, runs the work and begins a new buffer.
+  - The pipeline compiles lazily from Minecraft's shader sources. Binding an invalid pipeline throws, so the pass checks `precompilePipeline().isValid()` and otherwise only clears, logging once.
+  - The shaders were compiled offline with Minecraft's shaderc settings and reflected with SPIRV-Cross before shipping (see the Blaze3D gaps below for why that matters).
+- *Blaze3D gap found (26.2): no depth-only passes.*
+  - `CommandEncoder.createRenderPass` reads the first colour attachment's size without a null check, so `withUnusedColorAttachment()` cannot come first (NPE).
+  - `RenderPass.setPipeline` requires as many colour targets as attachments, and `RenderPipeline.Builder.build()` gives every pipeline at least one (`ColorTargetState.DEFAULT` when none is set).
+  - The pass therefore carries an `R8_UNORM` colour target the pipeline never writes (`WRITE_NONE`). It is cleared, never loaded; about 10 MB at 4112×2580, and a store of that size per frame on tiled GPUs.
+- *Original plan:*
 - *Shader:*
   - Port `chunkoutline/outline.vsh/.fsh` to MC's dialect: `#version 330`, a named std140 block, and a **per-instance vertex attribute** for the chunk position instead of the `ChunkPosBuffer` SSBO.
   - Ship it as `assets/voxy/shaders/core/<name>.vsh/.fsh`. MC's `ShaderManager` lists `shaders/` in every namespace, so the default `ShaderSource` finds it as `voxy:core/<name>`. Don't depend on `precompilePipeline(pipeline, customSource)`: `ShaderManager` calls `clearPipelineCache()` on resource reload, and the pipeline then recompiles from the default source.
@@ -567,6 +587,8 @@ grep -in "indirectcount\|dispatch" $B/systems/RenderPass.java $B/systems/Command
 grep -n "not yet supported" $B/systems/GpuDevice.java $B/systems/CommandEncoder.java  # array textures
 grep -n "depthAttachmentFormat\|stencilAttachmentFormat" $B/vulkan/VulkanRenderPipeline.java
 grep -n "pushConstant\|PushConstant" -r $B/pipeline $B/systems
+grep -n "assert firstAttachment != null" $B/systems/CommandEncoder.java            # depth-only passes (4.1's unused colour target)
+grep -n "activeColorTargetStateCount == 0" $B/pipeline/RenderPipeline.java
 ```
 
 ---
@@ -638,9 +660,9 @@ Two questions are already settled (see [Decisions](#decisions-2026-09-25)): GL i
 | `core/vk/render/VkHiZ.java` | 193 | — | HiZ pyramid compute | stays |
 | `core/vk/render/VkSSAO.java` | 189 | — | SSAO compute | 5.2 |
 | `core/vk/render/VkCompositor.java` | 313 | `GpuTextureView` (A) | stencil setup + composite into MC target | 4.2, 5.1 |
-| `core/vk/render/VkBoundRenderer.java` | 165 | — | depth-only instanced chunk-bound raster | 4.1 |
+| `core/vk/render/VkBoundRenderer.java` | 165 | — | depth-only instanced chunk-bound raster | deleted in 4.1 ✅ (now `Blaze3DBoundRenderer.java`, public API only) |
 | `core/vk/render/VkModelStore.java` | 134 | — | model/colour SSBOs + atlas upload | 3.1 |
-| `core/vk/render/VkViewport.java` | 113 | — | per-viewport buffers + offscreen targets | 3.2 |
+| `core/vk/render/VkViewport.java` | 113 | — | per-viewport buffers + offscreen targets | 3.2 (depth-bound target ✅ as Blaze3D textures) |
 | `core/vk/render/VkSectionGeometryData.java` | 94 | — | geometry + metadata buffers | 1.4 |
 | `mixin/vk/AccessorVulkanCommandEncoder.java` | 16 | private field (C) | — | deleted in 1.1 ✅ |
 | `mixin/vk/MixinVulkanBackend.java` | 35 | private method (C) | feature request | 0.1 (keep) |
