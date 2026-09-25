@@ -12,6 +12,8 @@ import me.cortex.voxy.client.core.vk.VkShaderSource;
 import me.cortex.voxy.client.core.vk.VkUploadStream;
 import me.cortex.voxy.common.Logger;
 import org.joml.Matrix4f;
+import org.joml.Vector3f;
+import org.joml.Vector3fc;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.VkRect2D;
@@ -46,9 +48,14 @@ public class VkTerrainRenderer {
     //MoltenVK fixed-count fallback state (see DrawBudget), fed by the per-pass draw
     // counts read back from drawCountCallBuffer each frame. On desktop the GPU sources
     // these counts itself via vkCmdDrawIndexedIndirectCount.
-    private final DrawBudget opaqueBudget = new DrawBudget(1024);
-    private final DrawBudget translucentBudget = new DrawBudget(256);
-    private final DrawBudget temporalBudget = new DrawBudget(256);
+    private final DrawBudget opaqueBudget = new DrawBudget(1024, true);
+    private final DrawBudget translucentBudget = new DrawBudget(256, true);
+    private final DrawBudget temporalBudget = new DrawBudget(256, false);
+    //Where the camera looked, and its vertical FOV (radians), when cmdgen built the latest
+    // draw lists and the lists before them: what the budgets are sized for
+    private final Vector3f listDir = new Vector3f();
+    private final Vector3f prevListDir = new Vector3f();
+    private float listFov, prevListFov;
 
     private final VkBuffer uniform;
     private final VkBuffer distanceCountBuffer;
@@ -350,12 +357,18 @@ public class VkTerrainRenderer {
             // scopes its own COMPUTE->TRANSFER->HOST barriers). The callback runs on the
             // render thread from pollRetired, so the plain field writes are race-free.
             // Desktop (drawIndirectCount) neither needs nor issues this.
+            this.prevListDir.set(this.listDir);
+            this.prevListFov = this.listFov;
+            //-Z of the view rotation is where the camera looks, in world space
+            viewport.modelView.positiveZ(this.listDir).negate().normalize();
+            this.listFov = (float) (2 * Math.atan(1 / Math.abs(viewport.vanillaProjection.m11())));
             long listFrame = this.ctx.currentFrame();
+            float dx = this.listDir.x, dy = this.listDir.y, dz = this.listDir.z;
             this.downloadStream.download(viewport.drawCountCallBuffer, 12, 12, (ptr, size) -> {
                 long now = System.currentTimeMillis();
-                this.opaqueBudget.record(listFrame, MemoryUtil.memGetInt(ptr), now);
-                this.translucentBudget.record(listFrame, MemoryUtil.memGetInt(ptr + 4), now);
-                this.temporalBudget.record(listFrame, MemoryUtil.memGetInt(ptr + 8), now);
+                this.opaqueBudget.record(listFrame, MemoryUtil.memGetInt(ptr), dx, dy, dz, now);
+                this.translucentBudget.record(listFrame, MemoryUtil.memGetInt(ptr + 4), dx, dy, dz, now);
+                this.temporalBudget.record(listFrame, MemoryUtil.memGetInt(ptr + 8), dx, dy, dz, now);
             });
         }
     }
@@ -363,27 +376,43 @@ public class VkTerrainRenderer {
     //Fixed-count draw budget for one terrain pass on MoltenVK, which lacks
     // drawIndirectCount. The GPU writes the real draw count, but the CPU has to pick
     // the multi-draw count when it records, and only learns the real counts from a
-    // readback 2-3 frames later. Slots past the real count are zeroed no-ops, yet each
-    // still costs a Metal draw (handing out the section-derived cap every frame is what
-    // made sky/occlusion culling bring no Mac speed-up), so the budget stays tight.
-    // Too tight drops visible sections for a few frames: holes that flicker while
-    // turning.
-    //The budget therefore covers the LARGEST count read back over the last few seconds,
-    // not just the latest one: turning back to a view seen moments ago (panning between
-    // a mountain side and the vista past it, or leaving a spyglass after a short zoom)
-    // needs as many draws as it did then. It then gets 50% growth plus fixed headroom,
-    // for views busier than anything seen in that time; -Dvoxy.vk.drawBudgetGrowth sets
-    // the growth (1.0-4.0). Desktop Vulkan sources the count on the GPU and always gets
-    // the cap.
+    // readback 2-3 frames later. Every slot past the real count is a zeroed no-op that
+    // still costs a Metal draw (MoltenVK encodes each one on the render thread, and the
+    // GPU still walks it); a slot short of it drops a visible section: holes that flicker
+    // while turning.
+    //Counts depend on where the camera looks, so each read-back count keeps the direction
+    // its list was built in, and the opaque and translucent budgets cover:
+    //  - the newest few counts (the readback lag), whatever the direction;
+    //  - counts from the last 8 s looking within 30 degrees of the list being drawn, so
+    //    turning back to a view seen moments ago (panning between a mountain side and the
+    //    vista past it, or leaving a spyglass after a short zoom) is covered, while looking
+    //    somewhere quieter is not charged for it;
+    //  - when no count looked that way (a quick turn into a new view), the largest count of
+    //    the last 8 s from anywhere, until that direction's own counts arrive.
+    // Holding the largest count from ANY direction for 8 s, as before, left most slots
+    // empty after every quick turn: 176k Metal draws for 42k real ones on an M2 Max.
+    //Temporal draws are the sections the last list lacked, so their count follows how fast
+    // the view changes rather than where it points: that budget covers the newest few
+    // counts, plus an estimate from the turn and FOV change since the last list (see
+    // predictedNewDraws).
+    //All budgets get 25% growth plus fixed headroom (-Dvoxy.vk.drawBudgetGrowth, 1.0-4.0).
+    // Desktop Vulkan sources the count on the GPU and always gets the cap.
     private static final class DrawBudget {
-        private static final int HOLD_SECONDS = 8;
+        private static final int SAMPLES = 2048;//read-back counts kept: 8 s even above 200 fps
+        private static final int RECENT_SAMPLES = 4;//covers the readback lag
+        private static final long HOLD_MS = 8_000;
+        private static final float SAME_VIEW_COS = 0.866f;//cos(30 degrees)
         private static final long SHORT_WINDOW_MS = 10_000;
         private static final double GROWTH = growthFromProperty();
 
         private final int headroom;
-        private final int[] secondMax = new int[HOLD_SECONDS];//largest count read back per second
-        private long second;
-        private boolean known;
+        private final boolean directional;
+        //Ring of read-back counts, newest at next-1: when each arrived, and where the camera
+        // looked when its list was built
+        private final long[] times = new long[SAMPLES];
+        private final int[] counts = new int[SAMPLES];
+        private final float[] dirs = new float[SAMPLES * 3];
+        private int next, size;
         //Diagnostics: the budget each recent list was drawn with, checked against its real
         // count once that is read back
         private final long[] budgetFrames = new long[8];
@@ -391,28 +420,49 @@ public class VkTerrainRenderer {
         private final ArrayDeque<Long> shortfalls = new ArrayDeque<>();
         private int lastCount, lastBudget;
 
-        DrawBudget(int headroom) {
+        DrawBudget(int headroom, boolean directional) {
             this.headroom = headroom;
+            this.directional = directional;
             Arrays.fill(this.budgetFrames, -1);
         }
 
-        int budget(int cap) {
-            if (!this.known) return cap;//before the first readback
-            int held = 0;
-            for (int count : this.secondMax) held = Math.max(held, count);
-            return (int) Math.min(cap, (long) (held * GROWTH) + this.headroom);
+        /** Largest read-back count that applies to a list built looking along {@code dir} (see the class comment); -1 before the first readback. */
+        int held(Vector3fc dir, long now) {
+            if (this.size == 0) return -1;
+            int recent = 0, near = -1, any = 0;
+            for (int age = 0; age < this.size; age++) {
+                int i = Math.floorMod(this.next - 1 - age, SAMPLES);
+                if (age >= RECENT_SAMPLES && (!this.directional || now - this.times[i] > HOLD_MS)) break;
+                int count = this.counts[i];
+                if (age < RECENT_SAMPLES) recent = Math.max(recent, count);
+                if (this.directional) {
+                    any = Math.max(any, count);
+                    float dot = this.dirs[3 * i] * dir.x() + this.dirs[3 * i + 1] * dir.y() + this.dirs[3 * i + 2] * dir.z();
+                    if (dot >= SAME_VIEW_COS) near = Math.max(near, count);
+                }
+            }
+            if (!this.directional) return recent;
+            return near < 0 ? any : Math.max(recent, near);
+        }
+
+        /** Multi-draw count for a list built looking along {@code dir}: at least {@code floor} draws plus headroom, at most {@code cap}. */
+        int budget(Vector3fc dir, long now, int floor, int cap) {
+            int held = this.held(dir, now);
+            if (held < 0) return cap;//before the first readback
+            long budget = Math.max((long) (held * GROWTH), floor) + this.headroom;
+            return (int) Math.min(cap, budget);
         }
 
         private static double growthFromProperty() {
             String value = System.getProperty("voxy.vk.drawBudgetGrowth", "");
-            if (value.isEmpty()) return 1.5;
+            if (value.isEmpty()) return 1.25;
             try {
                 double growth = Math.max(1.0, Math.min(4.0, Double.parseDouble(value)));
                 Logger.info("Voxy VK: MoltenVK draw budget growth set to " + growth + " (voxy.vk.drawBudgetGrowth)");
                 return growth;
             } catch (NumberFormatException e) {
                 Logger.warn("Voxy VK: ignoring invalid voxy.vk.drawBudgetGrowth=" + value);
-                return 1.5;
+                return 1.25;
             }
         }
 
@@ -424,20 +474,16 @@ public class VkTerrainRenderer {
             this.lastBudget = budget;
         }
 
-        void record(long listFrame, int count, long nowMillis) {
+        void record(long listFrame, int count, float dirX, float dirY, float dirZ, long nowMillis) {
             count = Math.max(0, count);
-            long second = nowMillis / 1000;
-            if (second != this.second) {
-                //Clear the slots of the seconds that passed since the last readback
-                long passed = Math.min(HOLD_SECONDS, second - this.second);
-                for (long s = 1; s <= passed; s++) {
-                    this.secondMax[(int) Math.floorMod(this.second + s, HOLD_SECONDS)] = 0;
-                }
-                this.second = second;
-            }
-            int slot = (int) Math.floorMod(second, HOLD_SECONDS);
-            this.secondMax[slot] = Math.max(this.secondMax[slot], count);
-            this.known = true;
+            int i = this.next;
+            this.times[i] = nowMillis;
+            this.counts[i] = count;
+            this.dirs[3 * i] = dirX;
+            this.dirs[3 * i + 1] = dirY;
+            this.dirs[3 * i + 2] = dirZ;
+            this.next = (i + 1) % SAMPLES;
+            this.size = Math.min(this.size + 1, SAMPLES);
             this.lastCount = count;
 
             int budgetSlot = (int) (listFrame & 7);
@@ -452,6 +498,22 @@ public class VkTerrainRenderer {
         String describe() {
             return this.lastCount + "/" + this.lastBudget + (this.shortfalls.isEmpty() ? "" : " short " + this.shortfalls.size());
         }
+    }
+
+    //Temporal draws are the sections visible now that the opaque pass's list (built last
+    // frame) lacked. After a quick turn, or while the FOV widens (leaving a spyglass), that
+    // is much of the view, and its count arrives too late to size this frame's draw. So
+    // estimate it: the share of the view the turn and the FOV gain exposed since the last
+    // list (with 50% margin), times the draws the opaque pass needs looking this way (with
+    // the usual growth).
+    private int predictedNewDraws() {
+        if (this.listFov <= 0) return 0;
+        float turned = (float) Math.acos(Math.max(-1, Math.min(1, this.listDir.dot(this.prevListDir))));
+        float widened = Math.max(0, this.listFov - this.prevListFov);
+        float exposed = Math.min(1, 1.5f * (turned + widened) / this.listFov);
+        if (exposed < 0.01f) return 0;
+        int opaque = this.opaqueBudget.held(this.listDir, System.currentTimeMillis());
+        return opaque < 0 ? 0 : (int) (exposed * opaque * DrawBudget.GROWTH);
     }
 
     /** F3 lines: the MoltenVK draw budgets (desktop sources its draw counts on the GPU). */
@@ -471,8 +533,8 @@ public class VkTerrainRenderer {
         if (this.geometry.getSectionCount() == 0) return;
         this.uploadUniform(viewport);
         int cap = Math.min((int) (this.geometry.getSectionCount() * 4.4 + 128), VkViewport.OPAQUE_DRAW_COUNT);
-        //Draws the list cmdgen wrote last frame
-        int maxDraw = this.drawCount(this.opaqueBudget, this.ctx.currentFrame() - 1, cap);
+        //Draws the list cmdgen wrote last frame (listDir is still that list's direction)
+        int maxDraw = this.drawCount(this.opaqueBudget, this.ctx.currentFrame() - 1, cap, 0);
         this.renderTerrain(viewport, viewport.colour.view, this.terrainOpaque, 0, 4 * 3, maxDraw, clearTargets);
     }
 
@@ -480,7 +542,8 @@ public class VkTerrainRenderer {
         this.ensureTerrainPipelines(viewport);
         if (this.geometry.getSectionCount() == 0) return;
         int cap = Math.min(this.geometry.getSectionCount(), VkViewport.TEMPORAL_DRAW_COUNT);
-        int maxDraw = this.drawCount(this.temporalBudget, this.ctx.currentFrame(), cap);
+        int maxDraw = this.drawCount(this.temporalBudget, this.ctx.currentFrame(), cap,
+                this.ctx.vk().hasDrawIndirectCount ? 0 : this.predictedNewDraws());
         this.renderTerrain(viewport, viewport.colour.view, this.terrainOpaque, TEMPORAL_OFFSET * 5L * 4, 4 * 5, maxDraw, false);
     }
 
@@ -489,16 +552,16 @@ public class VkTerrainRenderer {
         this.ensureTerrainPipelines(viewport);
         if (this.geometry.getSectionCount() == 0) return;
         int cap = Math.min(this.geometry.getSectionCount(), VkViewport.TRANSLUCENT_DRAW_COUNT);
-        int maxDraw = this.drawCount(this.translucentBudget, this.ctx.currentFrame(), cap);
+        int maxDraw = this.drawCount(this.translucentBudget, this.ctx.currentFrame(), cap, 0);
         this.renderTerrain(viewport, viewport.colourSSAO.view, this.terrainTranslucent, TRANSLUCENT_OFFSET * 5L * 4, 4 * 4, maxDraw, false);
     }
 
     //Multi-draw count for one pass over the list cmdgen wrote in listFrame: the section-
     // derived cap on desktop, where the GPU sources the real count and the cap is only a
     // ceiling; the fixed-count budget on MoltenVK.
-    private int drawCount(DrawBudget budget, long listFrame, int cap) {
+    private int drawCount(DrawBudget budget, long listFrame, int cap, int floor) {
         if (this.ctx.vk().hasDrawIndirectCount) return cap;
-        int count = budget.budget(cap);
+        int count = budget.budget(this.listDir, System.currentTimeMillis(), floor, cap);
         budget.noteBudget(listFrame, count);
         return count;
     }
