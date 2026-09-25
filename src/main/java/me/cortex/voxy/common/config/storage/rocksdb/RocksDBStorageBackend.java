@@ -26,6 +26,26 @@ public class RocksDBStorageBackend extends StorageBackend {
     //NOTE: closes in order
     private final List<AbstractImmutableNativeReference> closeList = new ArrayList<>();
 
+    private static Throwable nativeLoadFailure;//Guarded by the class lock
+
+    //RocksDB.loadLibrary() only resets its state when loading fails with an IOException. Any
+    // other failure (e.g. "librocksdbjni-<platform> was not found inside JAR", a RuntimeException)
+    // leaves it LOADING, and every later call, including the static initializers of RocksDB's
+    // option classes, then sleeps forever. So never call it again after a failure, rethrow the
+    // first failure instead. Synchronized so no other thread is already waiting inside RocksDB
+    // when the load fails.
+    private static synchronized void loadNativeLibrary() {
+        if (nativeLoadFailure != null) {
+            throw new IllegalStateException("The RocksDB native library failed to load earlier, restart the game to retry", nativeLoadFailure);
+        }
+        try {
+            RocksDB.loadLibrary();
+        } catch (Throwable t) {
+            nativeLoadFailure = t;
+            throw t;
+        }
+    }
+
     public RocksDBStorageBackend(String path) {
         /*
         var lockPath = new File(path).toPath().resolve("LOCK");
@@ -49,7 +69,7 @@ public class RocksDBStorageBackend extends StorageBackend {
             }
         }
          */
-        RocksDB.loadLibrary();
+        loadNativeLibrary();
 
         //TODO: FIXME: DONT USE THE SAME options PER COLUMN FAMILY
         final ColumnFamilyOptions cfOpts = new ColumnFamilyOptions()

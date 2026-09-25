@@ -15,6 +15,10 @@ and this project uses versioning in the format `MAJOR.MINOR.PATCH+mcVERSION`.
 - `lwjgl-vulkan` / `lwjgl-shaderc` are now compile-only (Minecraft 26.2 ships them); the mod jar no longer bundles its own copies
 - Vulkan renderer creation is deferred to the next frame boundary (so its block-atlas readback runs after Minecraft's pending GPU work, e.g. a resource reload)
 
+### Fixed
+- The mod jar now really bundles RocksDB's Apple Silicon native, so worlds load outside the dev environment on M-series Macs (was `librocksdbjni-osx-arm64.jnilib was not found inside JAR`). The native-filtering task had stayed UP-TO-DATE since a build from the dev branch, whose rule drops every macOS native, because Gradle doesn't see edits inside an `exclude {}` closure; the kept natives are now a declared task input
+- A world whose storage fails to open no longer freezes the game. `VoxyInstance` only released its world lock on success, so the next chunk load waited forever on the render thread, and a failed RocksDB native load left RocksDB itself waiting forever on any retry. Voxy now reports the error once and stays disabled for that world until it is rejoined
+
 ### Fixed (Vulkan backend, see `VULKAN_BUG_AUDIT_OPUS5.md`)
 - Minecraft's images are always `GENERAL`: Voxy no longer transitions MC's depth/colour/lightmap/block atlas to other layouts or leaves them there (VK-01)
 - Voxy asks Minecraft to enable the device features it uses (`shaderInt64`, `fragmentStoresAndAtomics`, `drawIndirectFirstInstance`, and `drawIndirectCount` when supported) and gates on what was actually enabled; the raster-cull vertex shader no longer declares a writable SSBO (VK-02)

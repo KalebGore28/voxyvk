@@ -111,7 +111,8 @@ public abstract class MixinLevelRenderer implements IVoxyRenderSystemHolder {
                     + VulkanBackend.statusLine() + ")");
             return;
         }
-        WorldEngine world = this.identifier.getOrCreateEngine(true);
+        //Null when the world's storage failed to open; VoxyInstance has already reported why
+        WorldEngine world = this.identifier.getOrCreateEngine();
         if (world == null) {
             Logger.warn("Not creating renderer due to null engine");
             return;

@@ -12,6 +12,7 @@ import me.cortex.voxy.common.world.service.VoxelIngestService;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.concurrent.locks.StampedLock;
 import java.util.function.BooleanSupplier;
@@ -28,6 +29,7 @@ public abstract class VoxyInstance {
 
     private final StampedLock activeWorldLock = new StampedLock();
     private final HashMap<WorldIdentifier, WorldEngine> activeWorlds = new HashMap<>();
+    private final HashSet<WorldIdentifier> failedWorlds = new HashSet<>();//Guarded by activeWorldLock
 
     protected final ImportManager importManager;
 
@@ -149,23 +151,34 @@ public abstract class VoxyInstance {
             return world;
         }
         long stamp = this.activeWorldLock.writeLock();
+        //Unlocked in finally: a write lock leaked by a throwing createWorld blocks every later
+        // lookup forever, e.g. chunk ingest on the render thread, freezing the game
+        try {
+            if (!this.isRunning) {
+                Logger.error("Tried getting world object on voxy instance but its not running");
+                return null;
+            }
 
-        if (!this.isRunning) {
-            Logger.error("Tried getting world object on voxy instance but its not running");
+            world = this.activeWorlds.get(identifier);
+            if (world == null) {
+                //Don't retry a world whose storage failed to open, every chunk load would
+                // otherwise retry (and report) it again. Instances only live for a session
+                if (this.failedWorlds.contains(identifier)) return null;
+                //Create world here
+                try {
+                    world = this.createWorld(identifier);
+                } catch (RuntimeException | LinkageError e) {
+                    this.failedWorlds.add(identifier);
+                    Logger.error("Failed to create the world engine (e.g. its storage could not be opened), Voxy is disabled for this world until it is rejoined", e);
+                    return null;
+                }
+            }
+            world.markActive();
+
+            if (incrementRef) world.acquireRef();
+        } finally {
             this.activeWorldLock.unlockWrite(stamp);
-            return null;
         }
-
-        world = this.activeWorlds.get(identifier);
-        if (world == null) {
-            //Create world here
-            world = this.createWorld(identifier);
-        }
-        world.markActive();
-
-        if (incrementRef) world.acquireRef();
-
-        this.activeWorldLock.unlockWrite(stamp);
         identifier.cachedEngineObject = new WeakReference<>(world);
         return world;
     }
