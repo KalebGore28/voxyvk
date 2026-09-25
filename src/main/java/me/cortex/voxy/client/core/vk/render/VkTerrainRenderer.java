@@ -18,6 +18,8 @@ import org.lwjgl.vulkan.VkRect2D;
 import org.lwjgl.vulkan.VkRenderingAttachmentInfoKHR;
 import org.lwjgl.vulkan.VkRenderingInfoKHR;
 
+import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.List;
 
 import static org.lwjgl.system.MemoryStack.stackPush;
@@ -41,15 +43,12 @@ public class VkTerrainRenderer {
     private final VkSectionGeometryData geometry;
     private final VkModelStore modelStore;
 
-    //MoltenVK fixed-count fallback state: the last-known REAL per-pass draw counts,
-    // read back from drawCountCallBuffer each frame. On desktop the GPU sources
-    // these counts itself via vkCmdDrawIndexedIndirectCount. Initialised to the
-    // per-pass caps so the first few frames — before the first readback lands —
-    // behave like the old section-count fallback, then converge to the true
-    // visible counts.
-    private int fbOpaqueDraws = VkViewport.OPAQUE_DRAW_COUNT;
-    private int fbTranslucentDraws = VkViewport.TRANSLUCENT_DRAW_COUNT;
-    private int fbTemporalDraws = VkViewport.TEMPORAL_DRAW_COUNT;
+    //MoltenVK fixed-count fallback state (see DrawBudget), fed by the per-pass draw
+    // counts read back from drawCountCallBuffer each frame. On desktop the GPU sources
+    // these counts itself via vkCmdDrawIndexedIndirectCount.
+    private final DrawBudget opaqueBudget = new DrawBudget(1024);
+    private final DrawBudget translucentBudget = new DrawBudget(256);
+    private final DrawBudget temporalBudget = new DrawBudget(256);
 
     private final VkBuffer uniform;
     private final VkBuffer distanceCountBuffer;
@@ -335,44 +334,107 @@ public class VkTerrainRenderer {
         }
 
         if (!this.ctx.vk().hasDrawIndirectCount) {
-            //Read the three real per-pass draw counts back to the CPU so next frame's
-            // fixed-count multi-draws track them instead of the worst-case section
-            // cap (see fixedCountBudget). The counts live at opaque@12 / translucent@16
-            // / temporal@20 in drawCountCallBuffer; download those 12 bytes on the same
-            // async, frame-retired path the traversal request readback already uses
-            // (commit() scopes its own COMPUTE->TRANSFER->HOST barriers). The callback
-            // runs on the render thread from pollRetired, so the plain field writes are
-            // race-free. Desktop (drawIndirectCount) neither needs nor issues this.
+            //Read the three real per-pass draw counts back to the CPU so the fixed-count
+            // multi-draws track them instead of the worst-case section cap (see
+            // DrawBudget). The counts live at opaque@12 / translucent@16 / temporal@20 in
+            // drawCountCallBuffer; download those 12 bytes on the same async,
+            // frame-retired path the traversal request readback already uses (commit()
+            // scopes its own COMPUTE->TRANSFER->HOST barriers). The callback runs on the
+            // render thread from pollRetired, so the plain field writes are race-free.
+            // Desktop (drawIndirectCount) neither needs nor issues this.
+            long listFrame = this.ctx.currentFrame();
             this.downloadStream.download(viewport.drawCountCallBuffer, 12, 12, (ptr, size) -> {
-                this.fbOpaqueDraws = clampCount(MemoryUtil.memGetInt(ptr), VkViewport.OPAQUE_DRAW_COUNT);
-                this.fbTranslucentDraws = clampCount(MemoryUtil.memGetInt(ptr + 4), VkViewport.TRANSLUCENT_DRAW_COUNT);
-                this.fbTemporalDraws = clampCount(MemoryUtil.memGetInt(ptr + 8), VkViewport.TEMPORAL_DRAW_COUNT);
+                long now = System.currentTimeMillis();
+                this.opaqueBudget.record(listFrame, MemoryUtil.memGetInt(ptr), now);
+                this.translucentBudget.record(listFrame, MemoryUtil.memGetInt(ptr + 4), now);
+                this.temporalBudget.record(listFrame, MemoryUtil.memGetInt(ptr + 8), now);
             });
         }
     }
 
-    private static int clampCount(int value, int cap) {
-        return value < 0 ? 0 : Math.min(value, cap);
+    //Fixed-count draw budget for one terrain pass on MoltenVK, which lacks
+    // drawIndirectCount. The GPU writes the real draw count, but the CPU has to pick
+    // the multi-draw count when it records, and only learns the real counts from a
+    // readback 2-3 frames later. Slots past the real count are zeroed no-ops, yet each
+    // still costs a Metal draw (handing out the section-derived cap every frame is what
+    // made sky/occlusion culling bring no Mac speed-up), so the budget stays tight.
+    // Too tight drops visible sections for a few frames: holes that flicker while
+    // turning.
+    //The budget therefore covers the LARGEST count read back over the last few seconds,
+    // not just the latest one: turning back to a view seen moments ago (panning between
+    // a mountain side and the vista past it, or leaving a spyglass after a short zoom)
+    // needs as many draws as it did then. It then gets 50% growth plus fixed headroom.
+    // Desktop Vulkan sources the count on the GPU and always gets the cap.
+    private static final class DrawBudget {
+        private static final int HOLD_SECONDS = 8;
+        private static final long SHORT_WINDOW_MS = 10_000;
+
+        private final int headroom;
+        private final int[] secondMax = new int[HOLD_SECONDS];//largest count read back per second
+        private long second;
+        private boolean known;
+        //Diagnostics: the budget each recent list was drawn with, checked against its real
+        // count once that is read back
+        private final long[] budgetFrames = new long[8];
+        private final int[] budgets = new int[8];
+        private final ArrayDeque<Long> shortfalls = new ArrayDeque<>();
+        private int lastCount, lastBudget;
+
+        DrawBudget(int headroom) {
+            this.headroom = headroom;
+            Arrays.fill(this.budgetFrames, -1);
+        }
+
+        int budget(int cap) {
+            if (!this.known) return cap;//before the first readback
+            int held = 0;
+            for (int count : this.secondMax) held = Math.max(held, count);
+            return (int) Math.min(cap, (long) (held * 1.5) + this.headroom);
+        }
+
+        //The draw of the list cmdgen wrote in listFrame used this budget
+        void noteBudget(long listFrame, int budget) {
+            int slot = (int) (listFrame & 7);
+            this.budgetFrames[slot] = listFrame;
+            this.budgets[slot] = budget;
+            this.lastBudget = budget;
+        }
+
+        void record(long listFrame, int count, long nowMillis) {
+            count = Math.max(0, count);
+            long second = nowMillis / 1000;
+            if (second != this.second) {
+                //Clear the slots of the seconds that passed since the last readback
+                long passed = Math.min(HOLD_SECONDS, second - this.second);
+                for (long s = 1; s <= passed; s++) {
+                    this.secondMax[(int) Math.floorMod(this.second + s, HOLD_SECONDS)] = 0;
+                }
+                this.second = second;
+            }
+            int slot = (int) Math.floorMod(second, HOLD_SECONDS);
+            this.secondMax[slot] = Math.max(this.secondMax[slot], count);
+            this.known = true;
+            this.lastCount = count;
+
+            int budgetSlot = (int) (listFrame & 7);
+            if (this.budgetFrames[budgetSlot] == listFrame && count > this.budgets[budgetSlot]) {
+                this.shortfalls.addLast(nowMillis);
+            }
+            while (!this.shortfalls.isEmpty() && this.shortfalls.peekFirst() < nowMillis - SHORT_WINDOW_MS) {
+                this.shortfalls.pollFirst();
+            }
+        }
+
+        String describe() {
+            return this.lastCount + "/" + this.lastBudget + (this.shortfalls.isEmpty() ? "" : " short " + this.shortfalls.size());
+        }
     }
 
-    /**
-     * Draw-count upper bound for one terrain pass. On desktop Vulkan the GPU sources
-     * the real count from drawCountCallBuffer (vkCmdDrawIndexedIndirectCount), so the
-     * section-derived {@code cap} is only a ceiling and is returned unchanged. On
-     * MoltenVK — which lacks drawIndirectCount — the fixed-count multi-draw instead
-     * iterates whatever count it is handed, encoding one Metal draw per slot; handing
-     * it the section-count ceiling means tens of thousands of no-op draws every frame,
-     * invariant to where the camera looks (this is why sky/occlusion culling produced
-     * no Mac speed-up). Bounding it to the last-known real count plus headroom lets the
-     * culling actually reduce Mac draw cost. The full drawCallBuffer is still zeroed per
-     * frame, so every slot within the ceiling reads either a real command or a no-op —
-     * a transient under-estimate during fast camera motion only drops a few LOD draws
-     * for a frame or two, never reads stale geometry.
-     */
-    private int fixedCountBudget(int lastKnownCount, int headroom, int cap) {
-        if (this.ctx.vk().hasDrawIndirectCount) return cap;
-        int budget = (int) (lastKnownCount * 1.5f) + headroom;
-        return Math.min(cap, Math.max(0, budget));
+    /** F3 lines: the MoltenVK draw budgets (desktop sources its draw counts on the GPU). */
+    public void addDebugInfo(List<String> debug) {
+        if (this.ctx.vk().hasDrawIndirectCount) return;
+        debug.add("VK draws/budget (10s shortfalls): O " + this.opaqueBudget.describe()
+                + " T " + this.temporalBudget.describe() + " X " + this.translucentBudget.describe());
     }
 
     public void renderOpaque(VkViewport viewport, boolean clearTargets) {
@@ -385,7 +447,8 @@ public class VkTerrainRenderer {
         if (this.geometry.getSectionCount() == 0) return;
         this.uploadUniform(viewport);
         int cap = Math.min((int) (this.geometry.getSectionCount() * 4.4 + 128), VkViewport.OPAQUE_DRAW_COUNT);
-        int maxDraw = this.fixedCountBudget(this.fbOpaqueDraws, 1024, cap);
+        //Draws the list cmdgen wrote last frame
+        int maxDraw = this.drawCount(this.opaqueBudget, this.ctx.currentFrame() - 1, cap);
         this.renderTerrain(viewport, viewport.colour.view, this.terrainOpaque, 0, 4 * 3, maxDraw, clearTargets);
     }
 
@@ -393,7 +456,7 @@ public class VkTerrainRenderer {
         this.ensureTerrainPipelines(viewport);
         if (this.geometry.getSectionCount() == 0) return;
         int cap = Math.min(this.geometry.getSectionCount(), VkViewport.TEMPORAL_DRAW_COUNT);
-        int maxDraw = this.fixedCountBudget(this.fbTemporalDraws, 256, cap);
+        int maxDraw = this.drawCount(this.temporalBudget, this.ctx.currentFrame(), cap);
         this.renderTerrain(viewport, viewport.colour.view, this.terrainOpaque, TEMPORAL_OFFSET * 5L * 4, 4 * 5, maxDraw, false);
     }
 
@@ -402,8 +465,18 @@ public class VkTerrainRenderer {
         this.ensureTerrainPipelines(viewport);
         if (this.geometry.getSectionCount() == 0) return;
         int cap = Math.min(this.geometry.getSectionCount(), VkViewport.TRANSLUCENT_DRAW_COUNT);
-        int maxDraw = this.fixedCountBudget(this.fbTranslucentDraws, 256, cap);
+        int maxDraw = this.drawCount(this.translucentBudget, this.ctx.currentFrame(), cap);
         this.renderTerrain(viewport, viewport.colourSSAO.view, this.terrainTranslucent, TRANSLUCENT_OFFSET * 5L * 4, 4 * 4, maxDraw, false);
+    }
+
+    //Multi-draw count for one pass over the list cmdgen wrote in listFrame: the section-
+    // derived cap on desktop, where the GPU sources the real count and the cap is only a
+    // ceiling; the fixed-count budget on MoltenVK.
+    private int drawCount(DrawBudget budget, long listFrame, int cap) {
+        if (this.ctx.vk().hasDrawIndirectCount) return cap;
+        int count = budget.budget(cap);
+        budget.noteBudget(listFrame, count);
+        return count;
     }
 
     private void renderTerrain(VkViewport viewport, long colorView, VkShaderPipeline pipeline,

@@ -284,6 +284,7 @@ public class VkRenderCore {
         this.modelService.addDebugData(debug);
         this.renderGen.addDebugData(debug);
         this.nodeManager.addDebug(debug);
+        this.terrainRenderer.addDebugInfo(debug);
         this.ssao.addDebugInfo(debug);
     }
 
