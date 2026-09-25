@@ -50,9 +50,11 @@ Work happens on the branch `blaze3d-migration`, off `vulkan-audit-fixes`. Sectio
 | 0.1 Blaze3D-VK classes only in `MinecraftVkHostAdapter` + `mixin/vk` | Done | `6fc22f19` |
 | 0.2 Contracts D1–D11 on `IVkHost`; D5 checked at device creation | Done | `b81829ec` |
 | 1.1 Frame spliced in with `execute()`; `AccessorVulkanCommandEncoder` deleted | Done, tested in-game (see below) | `16678071` |
-| 1.2 Frame retirement through `GpuFence` | Next | |
-| 1.3 MC's destruction queue for deferred destroys | Next | |
-| 1.4 Allocations through MC's VMA | Next | |
+| 1.2 Frame retirement through `GpuFence` | Done, needs in-game testing | `dded36b2` |
+| 1.3 MC's destruction queue for deferred destroys (immediate during teardown) | Done, needs in-game testing | `7a56ff41` |
+| 1.4 Allocations through MC's VMA | Done, needs in-game testing | `e14ef866` |
+| 1.5 (optional) Samplers from Blaze3D | Not started | |
+| Phase 2 remainder (2.1 GPU timing, 2.2 `DeviceInfo`) | Not started | |
 
 In-game checks for the finished steps:
 - VK (Prefer Vulkan), with `--vulkanValidation` if the validation layer is installed.
@@ -65,6 +67,11 @@ Tested 2026-09-25 (jar `1667807`, M2 Max, Vulkan/MoltenVK, a server with a large
 - The log has none of the new code's failure messages, and the startup feature check passed.
 - The renderer was built, rebuilt when the server set the view distance (pre-existing behaviour), and shut down cleanly.
 - Not reported yet: the F3+T reload and the GL regression check.
+
+What to watch for with 1.2–1.4:
+- **1.2:** frame retirement drives readbacks and staging reuse. If it breaks, LODs stop loading or refining, and the log shows *"VK upload stream full"* or *"VK download stream full"* with hitches.
+- **1.3:** GPU objects are now destroyed by MC's queue. Test world leave/rejoin, a resource-pack reload, resizing the window (recreates Voxy's targets) and changing Voxy's render distance. Watch for a device-lost crash, or *"VkFrameCtx used after teardown began"* in the log.
+- **1.4:** memory now comes from MC's allocator. The log should still say *"Allocating 2048MB VK geometry buffer"* with no *"VK geometry allocation failed, retrying"* line, and GPU memory use should look the same.
 
 ---
 
@@ -316,7 +323,8 @@ Every step should land on its own (build, test, commit). Verify each step on:
   - (c) The "no frame command buffer at hook point" skip in `VkRenderCore.renderFrame` goes away.
 - *Done when:* the accessor mixin is removed from `client.voxy.mixins.json`, frames look identical, and validation is clean.
 
-**1.2 Frame retirement through public `GpuFence`**
+**1.2 Frame retirement through public `GpuFence` — ✅ done (`dded36b2`)**
+- *As built:* as described below. `IVkHost.signalSemaphore` is gone, and so is the timeline-semaphore part of the D5 check.
 - *Goal:* drop the Voxy timeline semaphore and `signalSemaphore` (Tier B), and get a retirement mechanism the GL streams can share later.
 - *How:*
   - At `endFrame`, `fences.add(frameIdx, RenderSystem.getDevice().createCommandEncoder().createFence())`.
@@ -325,11 +333,13 @@ Every step should land on its own (build, test, commit). Verify each step on:
 - *Why public:* `createFence()` is on the backend-neutral `CommandEncoder`, and MC's own `RenderSystem.queueFencedTask` is built on it.
 - *Done when:* `VkFrameCtx` has no semaphore, upload/download streams still recycle and readbacks still fire, and nothing hitches on world unload.
 
-**1.3 Use MC's destruction queue for deferred destroys**
+**1.3 Use MC's destruction queue for deferred destroys — ✅ done (`7a56ff41`)**
+- *As built:* `VkFrameCtx.deferDestroy(Runnable)` goes through `IVkHost.deferDestroy`, which is MC's `queueForDestroy`. One addition to the plan: `VkFrameCtx.beginTeardown()` idles the device on shutdown, and when no Voxy frame is still unsubmitted it destroys every later free immediately. Without that, a renderer rebuilt right away (e.g. on a server's view-distance change at join) would allocate its 2 GB geometry buffer while the old one still waited in MC's queue. `cmd()` refuses to record after teardown begins.
 - *How:* replace `VkFrameCtx.pendingDestroys` (`deferDestroy*`, `:265`) with `encoder.queueForDestroy(() -> …)`. MC destroys them two submits later, which matches D4. At game exit, anything still queued is run by MC's own `commandEncoder.destroy()`. `VulkanDevice.close` calls that before `vkDestroyDevice`, and after `MixinVulkanDevice`'s HEAD hook, so the device is still alive. Re-check that ordering on each port (§7).
 - *Done when:* `PendingDestroy` is deleted and there are no leaks or use-after-free under validation across repeated world join/leave.
 
-**1.4 Allocate through MC's VMA instead of raw `vkAllocateMemory`**
+**1.4 Allocate through MC's VMA instead of raw `vkAllocateMemory` — ✅ done (`e14ef866`)**
+- *As built:* this doesn't use MC's `AUTO_PREFER_DEVICE` flags. It uses `VMA_MEMORY_USAGE_UNKNOWN` with the same required/preferred flags as before, so VMA picks the same memory types the manual search did. Host-visible buffers are persistently mapped (`VMA_ALLOCATION_CREATE_MAPPED_BIT`). The `vmaGetHeapBudgets` bonus is skipped, because MC doesn't enable `VK_EXT_memory_budget` and VMA would only report estimates.
 - *How:*
   - Add `compileOnly("org.lwjgl:lwjgl-vma:${lwjglVersion}")`. Don't bundle it; MC ships it, like `lwjgl-vulkan`.
   - `VkBuffer` (`core/vk/VkBuffer.java:51`) and `VkImage2D` call `Vma.vmaCreateBuffer/vmaCreateImage(host.vma(), …)`, mirroring the flags MC uses in `VulkanGpuBuffer.Direct` (AUTO_PREFER_DEVICE, plus host-access flags for mapped buffers).
