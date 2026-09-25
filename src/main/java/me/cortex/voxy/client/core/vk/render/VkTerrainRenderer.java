@@ -56,6 +56,9 @@ public class VkTerrainRenderer {
     private final Vector3f listDir = new Vector3f();
     private final Vector3f prevListDir = new Vector3f();
     private float listFov, prevListFov;
+    //Lists left whose FOV changed recently (spyglass, sprinting): their counts follow no
+    // history yet, so the budgets stay conservative until those counts are read back
+    private int fovUnsettledLists;
 
     private final VkBuffer uniform;
     private final VkBuffer distanceCountBuffer;
@@ -362,13 +365,18 @@ public class VkTerrainRenderer {
             //-Z of the view rotation is where the camera looks, in world space
             viewport.modelView.positiveZ(this.listDir).negate().normalize();
             this.listFov = (float) (2 * Math.atan(1 / Math.abs(viewport.vanillaProjection.m11())));
+            if (this.fovChanged()) {
+                this.fovUnsettledLists = DrawBudget.RECENT_SAMPLES;
+            } else if (this.fovUnsettledLists > 0) {
+                this.fovUnsettledLists--;
+            }
             long listFrame = this.ctx.currentFrame();
-            float dx = this.listDir.x, dy = this.listDir.y, dz = this.listDir.z;
+            float dx = this.listDir.x, dy = this.listDir.y, dz = this.listDir.z, fov = this.listFov;
             this.downloadStream.download(viewport.drawCountCallBuffer, 12, 12, (ptr, size) -> {
                 long now = System.currentTimeMillis();
-                this.opaqueBudget.record(listFrame, MemoryUtil.memGetInt(ptr), dx, dy, dz, now);
-                this.translucentBudget.record(listFrame, MemoryUtil.memGetInt(ptr + 4), dx, dy, dz, now);
-                this.temporalBudget.record(listFrame, MemoryUtil.memGetInt(ptr + 8), dx, dy, dz, now);
+                this.opaqueBudget.record(listFrame, MemoryUtil.memGetInt(ptr), dx, dy, dz, fov, now);
+                this.translucentBudget.record(listFrame, MemoryUtil.memGetInt(ptr + 4), dx, dy, dz, fov, now);
+                this.temporalBudget.record(listFrame, MemoryUtil.memGetInt(ptr + 8), dx, dy, dz, fov, now);
             });
         }
     }
@@ -380,38 +388,41 @@ public class VkTerrainRenderer {
     // still costs a Metal draw (MoltenVK encodes each one on the render thread, and the
     // GPU still walks it); a slot short of it drops a visible section: holes that flicker
     // while turning.
-    //Counts depend on where the camera looks, so each read-back count keeps the direction
-    // its list was built in, and the opaque and translucent budgets cover:
-    //  - the newest few counts (the readback lag), whatever the direction;
-    //  - counts from the last 8 s looking within 30 degrees of the list being drawn, so
-    //    turning back to a view seen moments ago (panning between a mountain side and the
-    //    vista past it, or leaving a spyglass after a short zoom) is covered, while looking
-    //    somewhere quieter is not charged for it;
-    //  - when no count looked that way (a quick turn into a new view), the largest count of
-    //    the last 8 s from anywhere, until that direction's own counts arrive.
-    // Holding the largest count from ANY direction for 8 s, as before, left most slots
-    // empty after every quick turn: 176k Metal draws for 42k real ones on an M2 Max.
+    //Counts depend on where the camera looks and how wide its FOV is, so each read-back
+    // count keeps both for its list, and the opaque and translucent budgets cover:
+    //  - the newest few counts (the readback lag), whatever the view;
+    //  - counts from the last 16 s looking within 30 degrees of the list being drawn, with
+    //    an FOV within 10% of its FOV, so turning back to a view seen moments ago (panning
+    //    between a mountain side and the vista past it) is covered, while looking somewhere
+    //    quieter is not charged for it;
+    //  - when no count looked that way (a quick turn into a new view), or while the FOV is
+    //    changing (a spyglass, sprinting: each step re-picks the LOD of the whole view), the
+    //    largest count of the last 16 s from any view, until the new view's counts arrive.
+    // Holding the largest count from ANY view for 8 s, as a first version did, left most
+    // slots empty after every quick turn: 176k Metal draws for 42k real ones on an M2 Max.
     //Temporal draws are the sections the last list lacked, so their count follows how fast
     // the view changes rather than where it points: that budget covers the newest few
-    // counts, plus an estimate from the turn and FOV change since the last list (see
+    // counts, plus an estimate from the turn or FOV change since the last list (see
     // predictedNewDraws).
     //All budgets get 25% growth plus fixed headroom (-Dvoxy.vk.drawBudgetGrowth, 1.0-4.0).
     // Desktop Vulkan sources the count on the GPU and always gets the cap.
     private static final class DrawBudget {
-        private static final int SAMPLES = 2048;//read-back counts kept: 8 s even above 200 fps
-        private static final int RECENT_SAMPLES = 4;//covers the readback lag
-        private static final long HOLD_MS = 8_000;
+        private static final int SAMPLES = 2048;//read-back counts kept: 16 s up to 128 fps
+        static final int RECENT_SAMPLES = 4;//covers the readback lag
+        private static final long HOLD_MS = 16_000;
         private static final float SAME_VIEW_COS = 0.866f;//cos(30 degrees)
+        private static final float SAME_FOV = 0.1f;//relative FOV difference
         private static final long SHORT_WINDOW_MS = 10_000;
         private static final double GROWTH = growthFromProperty();
 
         private final int headroom;
         private final boolean directional;
         //Ring of read-back counts, newest at next-1: when each arrived, and where the camera
-        // looked when its list was built
+        // looked (and its FOV) when its list was built
         private final long[] times = new long[SAMPLES];
         private final int[] counts = new int[SAMPLES];
         private final float[] dirs = new float[SAMPLES * 3];
+        private final float[] fovs = new float[SAMPLES];
         private int next, size;
         //Diagnostics: the budget each recent list was drawn with, checked against its real
         // count once that is read back
@@ -426,8 +437,12 @@ public class VkTerrainRenderer {
             Arrays.fill(this.budgetFrames, -1);
         }
 
-        /** Largest read-back count that applies to a list built looking along {@code dir} (see the class comment); -1 before the first readback. */
-        int held(Vector3fc dir, long now) {
+        /**
+         * Largest read-back count that applies to a list built looking along {@code dir} with
+         * vertical FOV {@code fov} (see the class comment); {@code unsettled} while the FOV is
+         * changing. -1 before the first readback.
+         */
+        int held(Vector3fc dir, float fov, boolean unsettled, long now) {
             if (this.size == 0) return -1;
             int recent = 0, near = -1, any = 0;
             for (int age = 0; age < this.size; age++) {
@@ -438,16 +453,18 @@ public class VkTerrainRenderer {
                 if (this.directional) {
                     any = Math.max(any, count);
                     float dot = this.dirs[3 * i] * dir.x() + this.dirs[3 * i + 1] * dir.y() + this.dirs[3 * i + 2] * dir.z();
-                    if (dot >= SAME_VIEW_COS) near = Math.max(near, count);
+                    if (dot >= SAME_VIEW_COS && Math.abs(this.fovs[i] - fov) <= SAME_FOV * fov) {
+                        near = Math.max(near, count);
+                    }
                 }
             }
             if (!this.directional) return recent;
-            return near < 0 ? any : Math.max(recent, near);
+            return near < 0 || unsettled ? Math.max(recent, any) : Math.max(recent, near);
         }
 
-        /** Multi-draw count for a list built looking along {@code dir}: at least {@code floor} draws plus headroom, at most {@code cap}. */
-        int budget(Vector3fc dir, long now, int floor, int cap) {
-            int held = this.held(dir, now);
+        /** Multi-draw count for a list built with that view: at least {@code floor} draws plus headroom, at most {@code cap}. */
+        int budget(Vector3fc dir, float fov, boolean unsettled, long now, int floor, int cap) {
+            int held = this.held(dir, fov, unsettled, now);
             if (held < 0) return cap;//before the first readback
             long budget = Math.max((long) (held * GROWTH), floor) + this.headroom;
             return (int) Math.min(cap, budget);
@@ -474,7 +491,7 @@ public class VkTerrainRenderer {
             this.lastBudget = budget;
         }
 
-        void record(long listFrame, int count, float dirX, float dirY, float dirZ, long nowMillis) {
+        void record(long listFrame, int count, float dirX, float dirY, float dirZ, float fov, long nowMillis) {
             count = Math.max(0, count);
             int i = this.next;
             this.times[i] = nowMillis;
@@ -482,6 +499,7 @@ public class VkTerrainRenderer {
             this.dirs[3 * i] = dirX;
             this.dirs[3 * i + 1] = dirY;
             this.dirs[3 * i + 2] = dirZ;
+            this.fovs[i] = fov;
             this.next = (i + 1) % SAMPLES;
             this.size = Math.min(this.size + 1, SAMPLES);
             this.lastCount = count;
@@ -500,19 +518,31 @@ public class VkTerrainRenderer {
         }
     }
 
+    //Whether the FOV differs between the latest two lists (by more than float noise)
+    private boolean fovChanged() {
+        return Math.abs(this.listFov - this.prevListFov) > 0.005f * this.listFov;
+    }
+
     //Temporal draws are the sections visible now that the opaque pass's list (built last
-    // frame) lacked. After a quick turn, or while the FOV widens (leaving a spyglass), that
-    // is much of the view, and its count arrives too late to size this frame's draw. So
-    // estimate it: the share of the view the turn and the FOV gain exposed since the last
-    // list (with 50% margin), times the draws the opaque pass needs looking this way (with
-    // the usual growth).
+    // frame) lacked, and their count arrives too late to size this frame's draw. So estimate
+    // it from the draws the opaque pass needs for this view (with the usual growth), times
+    // the share of the view that is new:
+    //  - all of it when the FOV changed: every step of a spyglass zoom or a sprint's FOV
+    //    effect re-picks the LOD of the whole view, and a widening FOV adds new edges;
+    //  - after a turn, twice the angle turned over the FOV, capped at all of it. The margin
+    //    covers sections moving across the screen and changing LOD, and turns that are
+    //    not purely vertical.
     private int predictedNewDraws() {
         if (this.listFov <= 0) return 0;
-        float turned = (float) Math.acos(Math.max(-1, Math.min(1, this.listDir.dot(this.prevListDir))));
-        float widened = Math.max(0, this.listFov - this.prevListFov);
-        float exposed = Math.min(1, 1.5f * (turned + widened) / this.listFov);
-        if (exposed < 0.01f) return 0;
-        int opaque = this.opaqueBudget.held(this.listDir, System.currentTimeMillis());
+        float exposed;
+        if (this.fovChanged()) {
+            exposed = 1;
+        } else {
+            float turned = (float) Math.acos(Math.max(-1, Math.min(1, this.listDir.dot(this.prevListDir))));
+            exposed = Math.min(1, 2 * turned / this.listFov);
+            if (exposed < 0.01f) return 0;
+        }
+        int opaque = this.opaqueBudget.held(this.listDir, this.listFov, this.fovUnsettledLists > 0, System.currentTimeMillis());
         return opaque < 0 ? 0 : (int) (exposed * opaque * DrawBudget.GROWTH);
     }
 
@@ -533,7 +563,7 @@ public class VkTerrainRenderer {
         if (this.geometry.getSectionCount() == 0) return;
         this.uploadUniform(viewport);
         int cap = Math.min((int) (this.geometry.getSectionCount() * 4.4 + 128), VkViewport.OPAQUE_DRAW_COUNT);
-        //Draws the list cmdgen wrote last frame (listDir is still that list's direction)
+        //Draws the list cmdgen wrote last frame (listDir and listFov are still that list's)
         int maxDraw = this.drawCount(this.opaqueBudget, this.ctx.currentFrame() - 1, cap, 0);
         this.renderTerrain(viewport, viewport.colour.view, this.terrainOpaque, 0, 4 * 3, maxDraw, clearTargets);
     }
@@ -561,7 +591,7 @@ public class VkTerrainRenderer {
     // ceiling; the fixed-count budget on MoltenVK.
     private int drawCount(DrawBudget budget, long listFrame, int cap, int floor) {
         if (this.ctx.vk().hasDrawIndirectCount) return cap;
-        int count = budget.budget(this.listDir, System.currentTimeMillis(), floor, cap);
+        int count = budget.budget(this.listDir, this.listFov, this.fovUnsettledLists > 0, System.currentTimeMillis(), floor, cap);
         budget.noteBudget(listFrame, count);
         return count;
     }
