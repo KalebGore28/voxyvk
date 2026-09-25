@@ -48,6 +48,12 @@ public class DebugEntries {
     }
 
     private static boolean previousGpuDebugEnabled = false;
+
+    /** Whether F3's voxy:gpu_debug entry is showing right now: always on, or "in F3" while F3 is open. */
+    public static boolean isGpuDebugShown() {
+        return Minecraft.getInstance().debugEntries.isCurrentlyEnabled(GPU_DEBUG);
+    }
+
     public static void onRebuild(Map<Identifier, DebugScreenEntryStatus> allStatuses, List<Identifier> enabled) {
         var entry = allStatuses.getOrDefault(GPU_DEBUG, DebugScreenEntryStatus.NEVER);
         if ((entry!=DebugScreenEntryStatus.NEVER)!=previousGpuDebugEnabled) {

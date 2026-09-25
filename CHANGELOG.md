@@ -9,6 +9,9 @@ and this project uses versioning in the format `MAJOR.MINOR.PATCH+mcVERSION`.
 
 ## [Unreleased]
 
+### Added
+- Vulkan: F3 shows how long each part of Voxy's frame takes on the GPU (the `GpuTime` line) while the `voxy:gpu_debug` debug entry is showing (F3+F6 to set it), as on OpenGL. It is measured with Minecraft's public GPU timestamp queries. Each part is averaged over the last second, followed by the frame's average total and the worst frame in that second. Voxy only measures while the line is on screen, which splits its frame into one command buffer per part
+
 ### Changed
 - Vulkan: Minecraft's block atlas is now read back asynchronously through Blaze3D's public API. The copy is recorded into Minecraft's own command stream instead of a separate queue submission that stalled until the GPU finished, and the model bakery starts baking once the pixels arrive, about a frame later. After joining a world or reloading resources, LODs can appear a frame or two later. OpenGL still reads the atlas synchronously, as before
 - Vulkan: Voxy's frame is recorded into its own command buffer and spliced into Minecraft's frame through the encoder's public methods, instead of reading the encoder's private command buffer. It no longer skips a frame when Minecraft has no command buffer open at the hook

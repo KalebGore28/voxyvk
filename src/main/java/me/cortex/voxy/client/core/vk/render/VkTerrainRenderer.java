@@ -261,6 +261,10 @@ public class VkTerrainRenderer {
             this.ctx.computeToDrawBarrier();
         }
 
+        //GPU timing sections (F3 GpuTime, same labels as GL). A marker can begin a new
+        // command buffer, so cmd is fetched again after each one.
+        this.ctx.gpuMarker("OT");
+        cmd = this.ctx.cmd();
         {//raster occlusion test into the visibility buffer (depth-tested box draw, no writes)
             this.beginRendering(viewport, 0L, true);//depth-only
             this.cullRaster.bind(cmd);
@@ -284,6 +288,8 @@ public class VkTerrainRenderer {
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
         }
 
+        this.ctx.gpuMarker("CG");
+        cmd = this.ctx.cmd();
         {//command generation (indirect dispatch sized by prep)
             vkCmdFillBuffer(cmd, this.distanceCountBuffer.buffer, 0, 1024L * 4, 0);
             this.ctx.barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -306,6 +312,8 @@ public class VkTerrainRenderer {
             this.ctx.computeToComputeBarrier();
         }
 
+        this.ctx.gpuMarker("TS");
+        cmd = this.ctx.cmd();
         {//translucency sorting
             this.prefixSum.bind(cmd);
             try (var b = this.prefixSum.binder()) {

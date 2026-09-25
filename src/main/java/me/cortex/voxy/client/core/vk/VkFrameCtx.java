@@ -27,7 +27,10 @@ import static org.lwjgl.vulkan.VK10.*;
 // per-submit pool, which endFrame splices into MC's frame submission right after
 // what MC recorded before the render hook (VulkanCommandEncoder.execute, through
 // IVkHost). Inside it: upload copies -> compute -> raster passes -> draws ->
-// readback copies, ordered with pipeline barriers. This class owns:
+// readback copies, ordered with pipeline barriers. While F3's GPU timing is on, the
+// frame is split into several such buffers, one per timed section (gpuMarker).
+// Pipeline barriers order everything earlier in submission order, so the split
+// changes nothing for synchronization. This class owns:
 //
 //  - the current recording target (cmd()), either the frame's command buffer
 //    (inside the render hook) or a one-shot immediate buffer (resource
@@ -58,6 +61,7 @@ public final class VkFrameCtx {
     private VkCommandBuffer frameCmd;      //the frame's command buffer while inside the hook
     private VkCommandBuffer immediateCmd;  //one-shot fallback outside the hook
     private boolean anyWorkThisFrame;
+    private boolean segmentUsed;           //something was recorded into frameCmd since it began
     private boolean renderingActive;       //a vkCmdBeginRenderingKHR without its end has been recorded
     private boolean destroyImmediately;    //set by beginTeardown once nothing is in flight
 
@@ -67,6 +71,7 @@ public final class VkFrameCtx {
     private final ArrayDeque<FrameFence> inFlight = new ArrayDeque<>();//oldest first
 
     private final ArrayList<FrameRetireListener> retireListeners = new ArrayList<>();
+    private final VkGpuTiming gpuTiming = new VkGpuTiming();
 
     private record FrameFence(long frameIdx, GpuFence fence) {}
 
@@ -74,6 +79,7 @@ public final class VkFrameCtx {
         this.ctx = ctx;
         this.host = host;
         this.ownerThread = Thread.currentThread();
+        this.addRetireListener(this.gpuTiming::onFramesRetired);
     }
 
     public VulkanContext vk() {
@@ -92,10 +98,41 @@ public final class VkFrameCtx {
     //==================================================================================
     // Recording targets
 
-    /** Enter the render hook: begin the frame's command buffer (from MC's per-submit pool). */
-    public void beginFrame() {
+    /** Enter the render hook: begin the frame's command buffer (from MC's per-submit pool); {@code timeGpu} times its sections (gpuMarker). */
+    public void beginFrame(boolean timeGpu) {
         if (this.frameCmd != null) throw new IllegalStateException("Frame already begun");
+        this.gpuTiming.beginFrame(timeGpu, this.frameCounter);
         this.frameCmd = this.host.beginSegment();
+        this.segmentUsed = false;
+    }
+
+    /**
+     * Opens the GPU-timed section {@code label}, closing the previous one (F3 "GpuTime"); a
+     * no-op unless this frame is timed. Blaze3D records the timestamp into MC's command
+     * stream, so what the frame recorded so far is spliced in first and a new command buffer
+     * begun: call this between passes, never inside a rendering instance, and fetch cmd()
+     * again afterwards.
+     */
+    public void gpuMarker(String label) {
+        if (this.frameCmd == null || !this.gpuTiming.canMark()) return;
+        if (this.renderingActive) throw new IllegalStateException("GPU timing marker inside a rendering instance");
+        //The timestamps are read once this frame retires, so it must get a retire fence
+        this.anyWorkThisFrame = true;
+        if (!this.segmentUsed) {
+            //Nothing recorded into this buffer yet: it is spliced in after MC's current
+            // buffer, which is where the timestamp goes
+            this.gpuTiming.mark(label);
+            return;
+        }
+        var cmd = this.frameCmd;
+        this.frameCmd = null;
+        this.host.endSegment(cmd);
+        try {
+            this.gpuTiming.mark(label);
+        } finally {
+            this.frameCmd = this.host.beginSegment();
+            this.segmentUsed = false;
+        }
     }
 
     /** Leave the render hook: close anything left open, restore MC's barrier invariant, splice the frame into MC's submission, schedule the retire signal. */
@@ -122,6 +159,9 @@ public final class VkFrameCtx {
             // out this frame must still run
             this.host.endSegment(cmd);
         }
+        //Closes the frame's GPU timing: a timestamp after Voxy's last buffer, in the same
+        // MC submission as the fence below
+        this.gpuTiming.endFrame();
         if (this.anyWorkThisFrame) {
             //On the MC submission the frame was just spliced into: completes once that
             // submission (MC's work and Voxy's frame) has executed
@@ -143,7 +183,10 @@ public final class VkFrameCtx {
             throw new IllegalStateException("VkFrameCtx used after teardown began");
         }
         this.anyWorkThisFrame = true;
-        if (this.frameCmd != null) return this.frameCmd;
+        if (this.frameCmd != null) {
+            this.segmentUsed = true;
+            return this.frameCmd;
+        }
         if (this.immediateCmd == null) {
             try (MemoryStack stack = stackPush()) {
                 var cbai = VkCommandBufferAllocateInfo.calloc(stack).sType$Default()
@@ -313,8 +356,14 @@ public final class VkFrameCtx {
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     }
 
+    /** F3 line with the GPU time of each timed section (see gpuMarker). */
+    public String gpuTimingDebug() {
+        return this.gpuTiming.getDebug();
+    }
+
     public void free() {
         this.beginTeardown();
+        this.gpuTiming.free();
         if (!this.destroyImmediately) {
             //A frame MC has not submitted yet still uses Voxy's objects; they stay in MC's
             // destruction queue, which destroys them once that frame has completed

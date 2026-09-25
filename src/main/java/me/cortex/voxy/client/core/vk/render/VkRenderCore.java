@@ -1,6 +1,7 @@
 package me.cortex.voxy.client.core.vk.render;
 
 import com.mojang.blaze3d.pipeline.RenderTarget;
+import me.cortex.voxy.client.DebugEntries;
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.RenderProperties;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
@@ -214,7 +215,7 @@ public class VkRenderCore {
         if (crs == null || !crs.initialized) return;
 
         this.frameCtx.flushImmediate();
-        this.frameCtx.beginFrame();
+        this.frameCtx.beginFrame(DebugEntries.isGpuDebugShown());
         try {
             if (me.cortex.voxy.commonImpl.VoxyCommon.IS_MINE_IN_ABYSS) {//same camera trickery as the GL setupViewport
                 int sector = (((int) Math.floor(camX) >> 4) + 512) >> 10;
@@ -238,6 +239,11 @@ public class VkRenderCore {
                     .update();
             viewport.frameId++;
             if (viewport.width <= 0 || viewport.height <= 0) return;
+
+            //gpuMarker opens a section of F3's GpuTime line (only while voxy:gpu_debug is
+            // showing). Labels shared with GL's GPUTiming mean the same pass; GL counts the
+            // HiZ in "I".
+            this.frameCtx.gpuMarker("setup");
             viewport.ensureTargets();
 
             var rt = new VkCompositor.VkViewportRT(viewport,
@@ -248,36 +254,46 @@ public class VkRenderCore {
 
             //1.5 raster the vanilla-visible chunk bounds into the depth-bound image
             // (sampled by the terrain draws below to cull LOD fragments behind vanilla)
+            this.frameCtx.gpuMarker("bounds");
             this.boundRenderer.render(viewport, this.visibleSectionStream);
 
             //2. opaque LOD terrain (draw calls generated LAST frame)
+            this.frameCtx.gpuMarker("RO");
             this.terrainRenderer.renderOpaque(viewport, false);
 
             //3. HiZ + node management + hierarchical traversal
+            this.frameCtx.gpuMarker("hiz");
             this.compositor.offscreenToSampled(viewport);
             viewport.hiZ.buildMipChain(viewport.depthSampleView, viewport.width, viewport.height);
             this.compositor.offscreenToAttachment(viewport);
 
+            this.frameCtx.gpuMarker("I");
             this.downloadStream.tick();
             this.nodeManager.tick(this.traversal.getNodeBuffer(), this.nodeCleaner);
             this.nodeCleaner.tick(this.traversal.getNodeBuffer());
             this.traversal.doTraversal(viewport);
 
             //4. build the draw commands for this frame (prep, raster cull, cmdgen, translucency sort)
+            this.frameCtx.gpuMarker("prep");
             this.terrainRenderer.buildDrawCalls(viewport);
 
             //5. temporal, then SSAO (reads colour+depth, writes colourSSAO with
             // sanitized alpha), then translucents onto the SSAO output — the same
             // opaque->temporal->SSAO->translucent order as the GL pipeline
+            this.frameCtx.gpuMarker("TP");
             this.terrainRenderer.renderTemporal(viewport);
+            this.frameCtx.gpuMarker("ao");
             this.ssao.compute(viewport, rt);
+            this.frameCtx.gpuMarker("RT");
             this.terrainRenderer.renderTranslucent(viewport);
 
             //6. composite into MC's frame
+            this.frameCtx.gpuMarker("comp");
             this.compositor.offscreenToSampled(viewport);
             this.compositor.composite(rt);
 
             //7. dynamic CPU work (uploads recycled, model baking, render distance tracking)
+            this.frameCtx.gpuMarker("dyn");
             this.uploadStream.tick();
             this.renderDistanceTracker.setCenterAndProcess(viewport.cameraX, viewport.cameraZ);
             this.modelService.tick(900_000);
@@ -300,6 +316,9 @@ public class VkRenderCore {
         this.nodeManager.addDebug(debug);
         this.terrainRenderer.addDebugInfo(debug);
         this.ssao.addDebugInfo(debug);
+        if (DebugEntries.isGpuDebugShown()) {
+            debug.add(this.frameCtx.gpuTimingDebug());
+        }
     }
 
     public void shutdown() {
