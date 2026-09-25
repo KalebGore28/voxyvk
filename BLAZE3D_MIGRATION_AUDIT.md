@@ -537,6 +537,12 @@ Every step should land on its own (build, test, commit). Verify each step on:
   - Samplers `depthTex`, `colourTex`; UBO `CompositeParams`; colour target format taken from MC's colour view.
   - The render pass targets `RenderTarget.getColorTextureView()/getDepthTextureView()`.
 - *Prerequisites:* the sampled colour must be a Blaze3D texture (needs 5.2) and the sampled depth must be one too (needs 5.1, or a D32 depth copy).
+- *Shorter route to the depth input, found 2026-09-25 (no 5.1 needed):* create `depthStencil` through Blaze3D as `D32_FLOAT_S8_UINT` (or `D24_UNORM_S8_UINT`), with `RENDER_ATTACHMENT | TEXTURE_BINDING`.
+  - MC's init barrier covers only the depth aspect (`VulkanGpuTexture`: `hasColorAspect() ? COLOR : DEPTH`), so Voxy moves the stencil aspect from `UNDEFINED` to `GENERAL` once, with a raw barrier.
+  - Voxy's raw passes (setup, terrain) attach it through a raw depth+stencil view on `IVkHost.vkImage(texture)`.
+  - A Blaze3D composite samples it through MC's own view, which is depth-aspect only.
+  - Only the setup pass (stencil writes; Blaze3D pipelines are D32-only, contract D7) stays raw. The route to 4.2 becomes 5.2 → 3.2 (`colour`, `colourSSAO`, `depthStencil`) → 4.2, and 5.1 becomes optional.
+  - After 3.2, SSAO itself (5.2) can also move to Blaze3D: its inputs are `colour`, Voxy's depth and MC's depth, and its output is `colourSSAO`.
 - *Payoff:* the one pass that writes MC's framebuffer follows MC's layouts, barriers and formats automatically, including a future HDR main target. It also deletes `VkFrameHost.mcImageBarrier`. The GL blit stays.
 
 ### Phase 5 — Research and decisions that unlock more
