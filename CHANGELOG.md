@@ -11,6 +11,7 @@ and this project uses versioning in the format `MAJOR.MINOR.PATCH+mcVERSION`.
 
 ### Changed
 - Vulkan: the chunk-bounds pass, which stops LODs from drawing inside the area regular chunks cover, now runs on Minecraft's own Blaze3D render API: a Blaze3D pipeline with Minecraft-format shaders (`voxy:core/chunk_bounds`), drawing into Blaze3D textures, with its per-frame data in Blaze3D's transient memory. It is Voxy's first Vulkan pass with no raw Vulkan calls (Blaze3D migration step 4.1). Rendering should look the same. If its shaders fail to compile, Voxy logs an error once and LODs render without that culling instead of failing
+- Vulkan: Voxy's LOD colour target is created through Blaze3D (migration step 3.2) and stays in `GENERAL` layout like Minecraft's own textures, so its layout transitions became plain memory barriers. Rendering should look the same
 
 ## [0.2.22+mc26.2] - 2026-09-25
 

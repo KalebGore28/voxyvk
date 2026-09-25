@@ -131,9 +131,9 @@ public class VkSSAO {
         this.ctx.barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
 
-        //opaque+temporal colour -> sampled; offscreen depth -> sampled; SSAO target -> storage
-        viewport.colour.transition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        //opaque+temporal colour writes -> this read (a Blaze3D texture, always GENERAL, so a
+        // plain memory barrier); offscreen depth -> sampled; SSAO target -> storage
+        this.ctx.barrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
         viewport.depthStencil.transition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
@@ -153,7 +153,7 @@ public class VkSSAO {
         this.pipeline.bind(cmd);
         try (var b = this.pipeline.binder()) {
             b.image(0, viewport.colourSSAO.view)
-                    .sampler(1, viewport.colour.view, this.colourSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                    .sampler(1, viewport.colourVkView, this.colourSampler, VK_IMAGE_LAYOUT_GENERAL)
                     .sampler(2, viewport.depthSampleView, this.depthSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             if (this.isBetterSSAO) {
                 b.sampler(3, VkFrameHost.vkView(rt.mcDepth()), this.depthSampler, VkFrameHost.MC_IMAGE_LAYOUT);

@@ -70,7 +70,7 @@ public class VkCompositor {
         d.vertGlsl = VkShaderSource.load("voxy:post/fullscreen2.vert", VkShaderSource.defs().props(this.properties).build());
         d.fragGlsl = VkShaderSource.load("voxy:post/setup_stencil_depth.frag", VkShaderSource.defs().props(this.properties).build());
         d.pushConstantBytes = 8;
-        d.colorFormat = viewport.viewport.colour.format;
+        d.colorFormat = VkViewport.COLOUR_FORMAT;
         d.depthFormat = viewport.viewport.depthStencil.format;
         d.stencilFormat = viewport.viewport.depthStencil.format;
         d.depthTest = true;
@@ -123,20 +123,16 @@ public class VkCompositor {
         var cmd = this.ctx.cmd();
         var viewport = rt.viewport;
 
-        //Voxy offscreen images -> attachment layouts (first use each frame).
-        //Batched into a single vkCmdPipelineBarrier (colour + depthStencil together)
-        // instead of two separate transitions
-        VkImage2D.transitionBatch(java.util.List.of(
-                new VkImage2D.BatchEntry(viewport.colour, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                        VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT),
-                new VkImage2D.BatchEntry(viewport.depthStencil, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                        VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)),
-                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT);
-        //depth-bound image: the clear happens inline as LOAD_OP_CLEAR inside
-        // VkBoundRenderer's render pass (or a no-section clear-only pass when
-        // there are no visible sections). Leave depthBound in its current layout;
-        // VkBoundRenderer transitions it to DEPTH_STENCIL_ATTACHMENT directly.
+        //Voxy's offscreen depth-stencil -> attachment layout (first use each frame). Its
+        // execution dependency (earlier fragment/compute reads -> this pass) also orders
+        // the earlier reads of the colour target, which this pass clears: a Blaze3D
+        // texture that stays in GENERAL and needs no transition.
+        //The depth-bound target is cleared and written by Blaze3DBoundRenderer's pass,
+        // which runs before this one.
+        viewport.depthStencil.transition(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
 
         //MC's depth writes (Sodium's opaque terrain) -> this pass's fragment-shader read
         VkFrameHost.mcImageBarrier(cmd, rt.mcDepth, true,
@@ -145,8 +141,8 @@ public class VkCompositor {
 
         try (MemoryStack stack = stackPush()) {
             var colorAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
-                    .imageView(viewport.colour.view)
-                    .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                    .imageView(viewport.colourVkView)
+                    .imageLayout(VK_IMAGE_LAYOUT_GENERAL)
                     .loadOp(VK_ATTACHMENT_LOAD_OP_CLEAR)
                     .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
             colorAttach.clearValue().color().float32(0, 0).float32(1, 0).float32(2, 0).float32(3, 0);

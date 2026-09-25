@@ -60,7 +60,8 @@ Work happens on the branch `blaze3d-migration`, off `vulkan-audit-fixes`. Everyt
 | 2.3 follow-up: drop deferred VK renderer creation | Decided: keep it (see [2.3](#phase-2--small-pieces-onto-the-public-blaze3d-api-vk-first)) | |
 | 4.1 Chunk-bounds pass on Blaze3D (with 3.2 for the depth-bound target) | Done, tested in-game (0.2.23) | `9a06f6d2` |
 | 1.5 (optional) Samplers from Blaze3D | Not started; do it together with 3.1, which touches the atlas sampler anyway | |
-| 3.1, 3.2 for the other targets, 4.2, Phase 5 | Not started | |
+| 3.2 LOD colour target as a Blaze3D texture | Done, needs in-game testing (0.2.23) | see git log |
+| 3.2 `depthStencil` (needs `separateDepthStencilLayouts`, see 4.2), `colourSSAO` (needs 5.2); 3.1, 4.2, Phase 5 | Not started; 4.2 deferred by the user (2026-09-25), easiest steps first | |
 
 In-game checks for the finished steps:
 - VK (Prefer Vulkan), with `--vulkanValidation` if the validation layer is installed.
@@ -491,7 +492,9 @@ Every step should land on its own (build, test, commit). Verify each step on:
   - Uploads go through MC's per-submit `TransientMemory`, so check peak per-frame upload size during heavy baking.
 - *Gotcha:* the texture's init barrier is recorded into MC's current buffer at creation, so create it outside a Voxy segment (1.1).
 
-**3.2 Depth-bound and main colour targets as `GpuTexture`s — depth-bound ✅ done with 4.1 (`9a06f6d2`); colour not started (needed by 4.2)**
+**3.2 Depth-bound and main colour targets as `GpuTexture`s — depth-bound ✅ done with 4.1 (`9a06f6d2`); colour ✅ done (0.2.23)**
+- *As built (colour):* `VkViewport.colour` is a Blaze3D `RGBA8_UNORM` texture (`RENDER_ATTACHMENT | TEXTURE_BINDING`). The setup, opaque and temporal passes attach it, and SSAO samples it, through `colourVkView` in `GENERAL`. SSAO's transition became a memory barrier, and the setup pass's depth-stencil transition already orders the earlier reads. `GENERAL` attachments cost nothing on MoltenVK; some desktop GPUs may lose colour compression, as MC's own targets do.
+- *`depthStencil`, still raw:* Blaze3D can create `D32_FLOAT_S8_UINT`, but MC's init barrier covers only the depth aspect. That is valid only with `separateDepthStencilLayouts`, which MC doesn't enable, so Voxy would request it in `MixinVulkanBackend` and move the stencil aspect itself.
 - *How:*
   - `depthBound`: `D32_FLOAT`, `RENDER_ATTACHMENT|TEXTURE_BINDING`.
   - `colour`: `RGBA8_UNORM`, `RENDER_ATTACHMENT|TEXTURE_BINDING`.

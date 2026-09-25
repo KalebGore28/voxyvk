@@ -30,8 +30,13 @@ public class VkViewport extends Viewport<VkViewport> {
     public final VkBuffer indirectLookupBuffer;
     public final VkBuffer visibilityBuffer;
 
-    //Offscreen targets, lazily (re)created on resize
-    public VkImage2D colour;
+    //Offscreen targets, lazily (re)created on resize.
+    //LOD colour (opaque + temporal draws, read by SSAO): a Blaze3D texture, in GENERAL
+    // layout for its whole life (contract D1); Voxy's raw passes use colourVkView
+    public static final int COLOUR_FORMAT = VK_FORMAT_R8G8B8A8_UNORM;
+    public GpuTexture colour;
+    public GpuTextureView colourView;
+    public long colourVkView;
     public VkImage2D depthStencil;
     public long depthSampleView;//DEPTH-aspect view of depthStencil for sampling
     //Depth-bound target (Blaze3DBoundRenderer): a Blaze3D D32 texture, in GENERAL layout for
@@ -67,16 +72,20 @@ public class VkViewport extends Viewport<VkViewport> {
     /** (Re)creates the offscreen targets on size change; true if recreated. */
     public boolean ensureTargets() {
         if (this.width <= 0 || this.height <= 0) return false;
-        if (this.colour != null && this.colour.width == this.width && this.colour.height == this.height) return false;
+        if (this.colour != null && this.colour.getWidth(0) == this.width && this.colour.getHeight(0) == this.height) return false;
         if (this.colour != null) {
-            this.colour.free();
+            this.freeColour();
             this.colourSSAO.free();
             this.depthStencil.free();
         }
-        this.colour = new VkImage2D(this.ctx, this.width, this.height, 1,
-                VK_FORMAT_R8G8B8A8_UNORM,
-                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                VK_IMAGE_ASPECT_COLOR_BIT, false);
+        //Blaze3D records its layout initialisation into MC's command stream, where it runs
+        // before anything Voxy records after this call
+        var device = RenderSystem.getDevice();
+        this.colour = device.createTexture("voxy lod colour",
+                GpuTexture.USAGE_RENDER_ATTACHMENT | GpuTexture.USAGE_TEXTURE_BINDING, GpuFormat.RGBA8_UNORM,
+                this.width, this.height, 1, 1);
+        this.colourView = device.createTextureView(this.colour);
+        this.colourVkView = VkFrameHost.vkView(this.colourView);
         this.colourSSAO = new VkImage2D(this.ctx, this.width, this.height, 1,
                 VK_FORMAT_R8G8B8A8_UNORM,
                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
@@ -112,6 +121,15 @@ public class VkViewport extends Viewport<VkViewport> {
         this.boundColourView = device.createTextureView(this.boundColour);
     }
 
+    //Blaze3D destroys it once the submission being recorded now has completed
+    private void freeColour() {
+        this.colourView.close();
+        this.colour.close();
+        this.colour = null;
+        this.colourView = null;
+        this.colourVkView = 0;
+    }
+
     //Blaze3D destroys them once the submission being recorded now has completed
     private void freeBoundTargets() {
         if (this.depthBound == null) return;
@@ -129,7 +147,7 @@ public class VkViewport extends Viewport<VkViewport> {
     protected void delete0() {
         super.delete0();
         if (this.colour != null) {
-            this.colour.free();
+            this.freeColour();
             this.colourSSAO.free();
             this.depthStencil.free();
         }

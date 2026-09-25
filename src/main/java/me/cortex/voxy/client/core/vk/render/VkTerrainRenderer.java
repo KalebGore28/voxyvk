@@ -152,7 +152,7 @@ public class VkTerrainRenderer {
     }
 
     private void ensureTerrainPipelines(VkViewport viewport) {
-        int cf = viewport.colour.format;
+        int cf = VkViewport.COLOUR_FORMAT;
         int df = viewport.depthStencil.format;
         if (this.terrainOpaque != null && cf == this.pipelineColorFormat && df == this.pipelineDepthFormat) return;
         if (this.terrainOpaque != null) {
@@ -276,7 +276,7 @@ public class VkTerrainRenderer {
         this.ctx.gpuMarker("OT");
         cmd = this.ctx.cmd();
         {//raster occlusion test into the visibility buffer (depth-tested box draw, no writes)
-            this.beginRendering(viewport, 0L, true);//depth-only
+            this.beginRendering(viewport, 0L, 0, true);//depth-only
             this.cullRaster.bind(cmd);
             VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
             try (var b = this.cullRaster.binder()) {
@@ -565,7 +565,7 @@ public class VkTerrainRenderer {
         int cap = Math.min((int) (this.geometry.getSectionCount() * 4.4 + 128), VkViewport.OPAQUE_DRAW_COUNT);
         //Draws the list cmdgen wrote last frame (listDir and listFov are still that list's)
         int maxDraw = this.drawCount(this.opaqueBudget, this.ctx.currentFrame() - 1, cap, 0);
-        this.renderTerrain(viewport, viewport.colour.view, this.terrainOpaque, 0, 4 * 3, maxDraw, clearTargets);
+        this.renderTerrain(viewport, viewport.colourVkView, VK_IMAGE_LAYOUT_GENERAL, this.terrainOpaque, 0, 4 * 3, maxDraw, clearTargets);
     }
 
     public void renderTemporal(VkViewport viewport) {
@@ -574,7 +574,7 @@ public class VkTerrainRenderer {
         int cap = Math.min(this.geometry.getSectionCount(), VkViewport.TEMPORAL_DRAW_COUNT);
         int maxDraw = this.drawCount(this.temporalBudget, this.ctx.currentFrame(), cap,
                 this.ctx.vk().hasDrawIndirectCount ? 0 : this.predictedNewDraws());
-        this.renderTerrain(viewport, viewport.colour.view, this.terrainOpaque, TEMPORAL_OFFSET * 5L * 4, 4 * 5, maxDraw, false);
+        this.renderTerrain(viewport, viewport.colourVkView, VK_IMAGE_LAYOUT_GENERAL, this.terrainOpaque, TEMPORAL_OFFSET * 5L * 4, 4 * 5, maxDraw, false);
     }
 
     /** Translucents draw onto the SSAO output (mirrors the GL fbSSAO target). */
@@ -583,7 +583,7 @@ public class VkTerrainRenderer {
         if (this.geometry.getSectionCount() == 0) return;
         int cap = Math.min(this.geometry.getSectionCount(), VkViewport.TRANSLUCENT_DRAW_COUNT);
         int maxDraw = this.drawCount(this.translucentBudget, this.ctx.currentFrame(), cap, 0);
-        this.renderTerrain(viewport, viewport.colourSSAO.view, this.terrainTranslucent, TRANSLUCENT_OFFSET * 5L * 4, 4 * 4, maxDraw, false);
+        this.renderTerrain(viewport, viewport.colourSSAO.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, this.terrainTranslucent, TRANSLUCENT_OFFSET * 5L * 4, 4 * 4, maxDraw, false);
     }
 
     //Multi-draw count for one pass over the list cmdgen wrote in listFrame: the section-
@@ -596,7 +596,7 @@ public class VkTerrainRenderer {
         return count;
     }
 
-    private void renderTerrain(VkViewport viewport, long colorView, VkShaderPipeline pipeline,
+    private void renderTerrain(VkViewport viewport, long colorView, int colorLayout, VkShaderPipeline pipeline,
                                long indirectOffset, long drawCountOffset, int maxDrawCount, boolean clear) {
         var cmd = this.ctx.cmd();
         this.ctx.barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -607,7 +607,7 @@ public class VkTerrainRenderer {
         //Resolve everything that can throw BEFORE opening the rendering instance
         long lightmapView = VkFrameHost.lightmapView();
         long depthBoundView = VkFrameHost.vkView(viewport.depthBoundView);
-        this.beginRendering(viewport, colorView, !clear);//LOAD unless first pass (which cleared via compositor setup)
+        this.beginRendering(viewport, colorView, colorLayout, !clear);//LOAD unless first pass (which cleared via compositor setup)
         pipeline.bind(cmd);
         VkCmd.setViewportScissor(cmd, viewport.width, viewport.height);
         try (var b = pipeline.binder()) {
@@ -649,7 +649,7 @@ public class VkTerrainRenderer {
      * happen in the depth-setup pass). {@code colorView} selects the colour
      * attachment (main colour vs SSAO output); 0 = depth-only.
      */
-    private void beginRendering(VkViewport viewport, long colorView, boolean load) {
+    private void beginRendering(VkViewport viewport, long colorView, int colorLayout, boolean load) {
         try (MemoryStack stack = stackPush()) {
             var depthAttach = VkRenderingAttachmentInfoKHR.calloc(stack).sType$Default()
                     .imageView(viewport.depthStencil.view)
@@ -669,7 +669,7 @@ public class VkTerrainRenderer {
             if (colorView != 0L) {
                 var colorAttach = VkRenderingAttachmentInfoKHR.calloc(1, stack).sType$Default()
                         .imageView(colorView)
-                        .imageLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                        .imageLayout(colorLayout)
                         .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
                         .storeOp(VK_ATTACHMENT_STORE_OP_STORE);
                 info.pColorAttachments(colorAttach);
