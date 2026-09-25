@@ -1,0 +1,486 @@
+# Voxy (voxyvk) × Blaze3D — dependency audit and migration plan
+
+| | |
+|---|---|
+| Audited | branch `vulkan-audit-fixes` @ `ee85c6f8`, 2026-09-25 |
+| Targets | Minecraft 26.2, Sodium `mc26.2-0.9.2`, Fabric Loader 0.19.3, LWJGL 3.4.1, Java 25 |
+| Ground truth | Blaze3D decompiled from the 26.2 jar via `./gradlew genSources` (see [§1](#1-how-this-was-checked-and-how-to-re-check)) |
+| Supersedes | `BLAZE3D_GAP_ANALYSIS.md` (deleted; written before the VK backend existed, several of its API claims are wrong for 26.2 — see [§2.4](#24-corrections-to-the-old-blaze3d_gap_analysismd)) |
+
+Goal of the plan: make future Minecraft ports cheaper by leaning on Blaze3D wherever it can do the work, and fencing off everything it can't.
+
+---
+
+## 0. TL;DR
+
+1. **The Vulkan path is about 90% self-implemented raw Vulkan.** Blaze3D supplies the device, queue and handles, the frame's command buffer and its submission, MC's render-target views (colour, depth, lightmap, block atlas), and one semaphore-signal hook. Voxy does everything else itself: memory, buffers, images, samplers, GLSL→SPIR-V, pipelines, descriptors, barriers and layouts, uploads, readbacks, frame retirement and deferred destruction. That is 35 files and about 5,050 lines, with about 122 raw Vulkan call sites (63 distinct `vk*` functions), against about 25 Blaze3D touchpoints in 11 files.
+2. **"Fully on Blaze3D" isn't reachable on 26.2.** Blaze3D has no compute shaders, no storage buffers or images, no stencil, no indirect-count draws, no push constants and no array textures, and its Vulkan pipelines hardcode a `D32_SFLOAT` depth attachment. Of Voxy's 19 VK pipelines, 13 are compute and 0 of those can move. Of the 6 graphics pipelines, 2 can move once their inputs change: chunk bounds after small changes (step 4.1), composite after 5.1/5.2. A third (depth setup) could move if stencil masking is removed.
+3. **The porting risk isn't the raw Vulkan code, which uses a stable API.** It's the coupling to Blaze3D's **Vulkan-backend internals**: one private-field accessor, one inject into a private method, the `com.mojang.blaze3d.vulkan.*` classes, and about 11 unwritten behavioural contracts (for example, MC keeps every image in `GENERAL` layout and ends every operation with a full barrier). MC 26.2 labels this backend *"Prefer Vulkan (Experimental)"*, so these are the likeliest things to break next version.
+4. **A second maintenance cost is the GL/VK mirroring.** The VK path mirrors the GL path class for class (about 20 pairs, [§4.2](#42-glvk-duplicate-pairs)). Every upstream (`MCRcortex/voxy`) renderer change has to be ported twice; the recent `fix: update Vulkan code for fog …` commits are exactly this. Moving a pass onto Blaze3D's *public* API collapses its GL and VK twins into **one implementation that runs on both MC backends**, which is where Blaze3D adoption pays off most.
+5. **Recommended order:**
+   - Phase 0: fence the internals into one adapter and write the contracts down (no behaviour change).
+   - Phase 1: swap private hooks for the public ones MC itself uses (`execute()`, `createFence()`, `queueForDestroy()`, VMA).
+   - Phase 2: move small backend-neutral pieces (GPU timing, device info, atlas readback).
+   - Phase 3: create textures through Blaze3D.
+   - Phase 4: pilot a Blaze3D `RenderPass` with the chunk-bounds renderer, then the composite pass.
+   - Phase 5: decide on stencil-free masking and fragment SSAO, which gate any further moves.
+   - Compute, traversal and terrain raster stay raw Vulkan until Mojang adds the missing features ([§6](#6-watchlist--blaze3d-features-that-would-unlock-more)).
+
+---
+
+## 1. How this was checked (and how to re-check)
+
+- Read all 35 files under `client/core/vk/**` and `client/mixin/vk/**`, the backend-neutral seams (`IDeviceBuffer`, `IModelStore`, `INodeGpuOps`, `IAtlasTextureReader`, `Abstract{Upload,Download}Stream`, …), `VoxyRenderSystem`, `RenderProperties`, and every mixin's target.
+- Decompiled MC 26.2 and read `com.mojang.blaze3d.*`: the public `GpuDevice`, `CommandEncoder`, `RenderPass`, `RenderPipeline`, `GpuBuffer`, `GpuTexture` and `BindGroupLayout`, plus the `vulkan` backend (`VulkanDevice`, `VulkanCommandEncoder`, `VulkanBackend`, `VulkanRenderPipeline`, `VulkanRenderPass`, `GlslCompiler`, `IntermediaryShaderModule`, …).
+
+Re-generate the sources in a future session (`genSources` writes only into `.gradle/loom-cache`):
+
+```bash
+./gradlew genSources
+```
+
+```bash
+mkdir -p /tmp/mc-src && unzip -o -q "$(ls .gradle/loom-cache/minecraftMaven/net/minecraft/minecraft-merged-*/26.2/*-sources.jar | head -1)" 'com/mojang/blaze3d/*' 'net/minecraft/client/*' -d /tmp/mc-src
+```
+
+---
+
+## 2. What Blaze3D 26.2 actually provides
+
+### 2.1 Public, backend-neutral API (the part worth building on)
+
+| Area | Available in 26.2 | Missing in 26.2 (blockers for Voxy) |
+|---|---|---|
+| Buffers — `GpuDevice.createBuffer` | usages `MAP_READ, MAP_WRITE, HINT_CLIENT_STORAGE, COPY_DST, COPY_SRC, VERTEX, INDEX, UNIFORM, UNIFORM_TEXEL_BUFFER, INDIRECT_PARAMETERS`; `map()`, slices | **no storage-buffer usage** (`VulkanConst.bufferUsageToVk` never sets `STORAGE_BUFFER_BIT`) |
+| Textures — `createTexture` / `createTextureView(tex, baseMip, count)` | 2D, mips, cubemaps; usages `COPY_DST, COPY_SRC, TEXTURE_BINDING, RENDER_ATTACHMENT, CUBEMAP_COMPATIBLE`; formats incl. `D32_FLOAT`, `D32_FLOAT_S8_UINT`, `D24_UNORM_S8_UINT`, `R32_FLOAT`, `RGBA8_UNORM` | **no storage-image usage**; `depthOrLayers > 1` throws *"Array or 3D textures are not yet supported"* |
+| Samplers — `createSampler`, `RenderSystem.getSamplerCache()` | address/filter modes, anisotropy, `maxLod` | mip mode is derived (`maxLod > 0.25 ⇒ LINEAR`), so no *nearest-mip over a full chain* (needed by HiZ) |
+| Pipelines — `RenderPipeline.builder()` | vertex + fragment; defines; `BindGroupLayout` (named samplers, `UNIFORM_BUFFER`, `TEXEL_BUFFER`); ≤8 `ColorTargetState` (format, blend, write mask); `DepthStencilState(compare, write, biasScale, biasConst)`; cull; polygon mode; topologies incl. `TRIANGLE_STRIP`; `VertexFormat.builder(stepRate)` (instancing) | **`ShaderType` = VERTEX, FRAGMENT only (no compute)**; **no stencil**; **no push constants**; no SSBO/storage-image bindings |
+| Render passes — `CommandEncoder.createRenderPass(RenderPassDescriptor)` | N colour + optional depth, clears, render area, `withUnusedColorAttachment()`; `setPipeline`, `bindTexture(name, view, sampler)`, `setUniform(name, buffer)`, vertex/index buffers, `draw/drawIndexed/multiDraw*`, **`drawIndirect` / `drawIndexedIndirect`** (buffer needs `USAGE_INDIRECT_PARAMETERS`), scissor, debug groups, `writeTimestamp` | **no indirect-count**, no dispatch |
+| Transfers | `writeToBuffer`, `copyToBuffer`, `writeToTexture` (per mip/region), `copyBufferToTexture`, `copyTextureToBuffer(+callback)`, `copyTextureToTexture`, clears | copies can only target Blaze3D objects |
+| Sync | `createFence()` → `GpuFence.awaitCompletion(t)`; `RenderSystem.queueFencedTask(Runnable)` (drained by MC every frame in `RenderSystem.executePendingTasks()`) | no user barriers (the backend inserts its own) |
+| Timing | `GpuDevice.createTimestampQueryPool(n)`, `CommandEncoder/RenderPass.writeTimestamp`, `GpuQueryPool.getValue`, `DeviceInfo.timestampPeriod()`, `TimerQuery` | — |
+| Transient/staging memory | `CommandEncoder.transientMemory()` (per-submit ring), `vertex.StagingBuffer`, `vertex.UberGpuBuffer` + `TlsfAllocator` | only feeds Blaze3D buffers |
+| Device info | `DeviceInfo` (name, vendorName, driverInfo, `backendName`, `isZZeroToOne`, `limits`, `features`, `underlyingExtensions`, `type`) | no subgroup / SSBO-range / memory-budget info |
+| Shaders | GLSL `#version 330` + `#moj_import`, resources bound **by name**; `ShaderManager` loads `.vsh/.fsh/.glsl` under `shaders/` from **every namespace** (so `assets/voxy/shaders/core/x.vsh` is `voxy:core/x`); `GpuDevice.precompilePipeline(pipeline, ShaderSource)` also exists, but its cache is cleared on resource reload | on VK, MC's reflection (SPIRV-Cross) only sees uniform buffers, 2D/cube samplers, texel buffers and stage in/out; **SSBOs, images and push constants are invisible to it** |
+
+### 2.2 Vulkan-backend internals (public classes, but not a stable API)
+
+`com.mojang.blaze3d.vulkan.*` — everything here can change without notice while the backend is experimental.
+
+- **`VulkanDevice`**:
+  - `instance()`, `vkDevice()`, `graphicsQueue()`, `computeQueue()`, `transferQueue()` (`VulkanQueue(vkQueue, queueFamilyIndex)`).
+  - **`vma()`**: MC's VMA allocator. `lwjgl-vma` ships with MC.
+  - `createCommandEncoder()`: returns the **single persistent** `VulkanCommandEncoder`.
+- **`VulkanCommandEncoder`**:
+  - Public: `allocateAndBeginTransientCommandBuffer()`, **`execute(VkCommandBuffer)`**, `waitSemaphore` / `signalSemaphore(sem, value, stage)`, **`queueForDestroy(Destroyable)`**, and a static `memoryBarrier(cmd, stack)`. MC itself uses `allocate…` + `execute` in `VulkanTransientMemory` and `VulkanGpuSurface`, and `queueForDestroy` everywhere.
+  - Private: `currentCommandBuffer`.
+- **Handle getters**: `VulkanGpuBuffer.vkBuffer()`, `VulkanGpuTexture.vkImage()`, `VulkanGpuTextureView.vkImageView()`, `VulkanGpuSampler.vkSampler()`, `VulkanConst.toVk(GpuFormat)`.
+- **Device creation**: `private static VulkanBackend.createDevice(Collection<String>, VulkanPhysicalDevice, Set<VulkanFeature>)`.
+  - Requires Vulkan 1.2.
+  - Required extensions: `VK_KHR_dynamic_rendering`, `VK_KHR_push_descriptor`, `VK_KHR_synchronization2`, `VK_EXT_vertex_attribute_divisor`, `VK_KHR_swapchain` (plus `multi_draw`, `portability_subset` and the checkpoint extensions when present).
+  - Features: `multiDrawIndirect, fillModeNonSolid, samplerAnisotropy, shaderDrawParameters, timelineSemaphore, hostQueryReset, synchronization2, dynamicRendering, vertexAttributeInstanceRateDivisor`. **No way to request more except a mixin.**
+
+### 2.3 Behaviour of MC's Vulkan backend that Voxy depends on
+
+| # | Contract (verified in 26.2 source) | Where Voxy relies on it |
+|---|---|---|
+| D1 | Every `VulkanGpuTexture` goes `UNDEFINED→GENERAL` once at creation and stays `GENERAL` forever | `VkFrameHost.MC_IMAGE_LAYOUT` (MC depth/colour/lightmap/atlas access) |
+| D2 | Every encoder operation **ends** with a full `ALL_COMMANDS / MEMORY_READ\|WRITE` barrier; nothing is ordered *before* a pass | `VkFrameCtx.endFrame` must end with `fullBarrier()` |
+| D3 | `VulkanDevice.createCommandEncoder()` returns one persistent encoder; at the Sodium OPAQUE `TAIL` hook its command buffer is open and no render pass is active | `MinecraftVkHostAdapter.frameCommandBuffer()` |
+| D4 | One submit per frame at the end of `Minecraft.renderFrame`; `MAX_SUBMITS_IN_FLIGHT = 2`, and `submit()` blocks on N−2 with a 5 s timeout | frame retirement, deferred destroys, renderer creation at `renderFrame` HEAD |
+| D5 | MC's device enables push descriptors, dynamic rendering, sync2 and timeline semaphores | `VkShaderPipeline` (push descriptors), `VkFrameCtx` (dynamic rendering, timeline) — Voxy never enables these itself |
+| D6 | MC only touches its graphics queue from the render thread | `VkFrameCtx.flushImmediate()` calls `vkQueueSubmit` on MC's queue directly |
+| D7 | Blaze3D VK pipelines are compiled with `depthAttachmentFormat = VK_FORMAT_D32_SFLOAT` (or none) and never a stencil format | limits which Voxy passes can become Blaze3D passes |
+| D8 | The block atlas has `COPY_SRC` usage and is `RGBA8_UNORM` | `VkAtlasTextureReader` |
+| D9 | `gameRenderer.levelLightmap()` is a 2D sampleable `GpuTextureView` | `VkFrameHost.lightmapView()` |
+| D10 | Reverse-Z is signalled by `DepthStencilState.DEFAULT` being `GREATER_THAN_OR_EQUAL`; `isZZeroToOne()` is true on VK | `RenderProperties.useReverseZ()` (shared GL/VK) |
+| D11 | Sodium draws opaque terrain through `SodiumWorldRenderer.drawChunkLayer(OPAQUE, …)` into `group.outputTarget()` on MC's device, with its render pass closed at `TAIL` | `MixinSodiumOpaqueVkFrame` |
+
+### 2.4 Corrections to the old `BLAZE3D_GAP_ANALYSIS.md`
+
+- **Indirect draws exist** (`drawIndirect`, `drawIndexedIndirect`, `USAGE_INDIRECT_PARAMETERS`). Only indirect-**count** is missing.
+- **Timestamp queries exist** (`createTimestampQueryPool`, `writeTimestamp`).
+- **Raw handles are extractable** through public getters (`vkImage()`, `vkImageView()`, `vkBuffer()`, `vkSampler()`, `vkDevice()`, `vma()`). It listed this as an open question.
+- **Texel buffers exist** (`UNIFORM_TEXEL_BUFFER` / `UniformType.TEXEL_BUFFER`).
+- There is no `FeatureRenderer` hook for terrain, and `GlTextureView` is GL-only.
+- **Not listed there but real blockers:** no stencil, the D32-only depth attachment in VK pipelines, 2D-only textures, and push constants and SSBOs invisible to MC's shader reflection.
+- The VK backend is **opt-in**. `PreferredGraphicsApi.DEFAULT` tries OpenGL first, and the UI calls Vulkan *"Experimental"*.
+
+---
+
+## 3. How the Voxy VK path uses Blaze3D today
+
+### 3.1 Frame flow
+
+```
+MC VulkanDevice.<init>  ──(MixinVulkanDevice TAIL)──▶ MinecraftVkHost.register(adapter)
+VulkanBackend.createDevice (private) ──(MixinVulkanBackend HEAD)──▶ + shaderInt64, fragmentStoresAndAtomics,
+                                                                     drawIndirectFirstInstance, drawIndirectCount?
+Minecraft.renderFrame HEAD ──(MixinMinecraftFrameStart)──▶ create pending VkRenderCore (atlas readback = own vkQueueSubmit)
+Sodium drawChunkLayer(OPAQUE) TAIL ──(MixinSodiumOpaqueVkFrame)──▶ VkRenderCore.renderFrame(outputTarget, …)
+    cmd = MC's currentCommandBuffer (AccessorVulkanCommandEncoder — private field)
+    ALL raw Vulkan, recorded into MC's cmd:
+      setup depth/stencil ▸ chunk bounds ▸ opaque terrain ▸ HiZ ▸ node mgmt + traversal (compute)
+      ▸ prep/raster-cull/cmdgen/prefix-sort (compute+raster) ▸ temporal ▸ SSAO (compute)
+      ▸ translucent ▸ composite into MC colour/depth
+    fullBarrier() ; VulkanCommandEncoder.signalSemaphore(voxyTimeline, frame)   (ends MC's cmd buffer)
+VulkanDevice.close HEAD ──(MixinVulkanDevice)──▶ Voxy shutdown + VulkanContext.destroy
+```
+
+### 3.2 Reliance in numbers
+
+| Measure | Value |
+|---|---|
+| VK path size | 35 files, ~5,050 lines (`core/vk` 30 files / 4,862; `mixin/vk` 5 / 187) |
+| Raw Vulkan call sites | ~122 (63 distinct `vk*` functions, excluding accessor methods like `vkImage()`) |
+| Files that touch Blaze3D at all | 11 of 35. Most use only one or two Blaze3D types; the rest of their code is raw Vulkan |
+| Files using `com.mojang.blaze3d.vulkan.*` internals | 7: `MinecraftVkHostAdapter`, `VkDeviceFeatures`, `VkAtlasTextureReader`, `render/VkFrameHost`, `mixin/vk/{AccessorVulkanCommandEncoder, MixinVulkanBackend, MixinVulkanDevice}` |
+| Mixins/accessors into Blaze3D-VK internals | 3 (plus 2 frame hooks on `Minecraft` and Sodium) |
+| Pipelines | 19 = 13 compute + 6 graphics, all built by Voxy's own `VkShaderPipeline` / `ShadercCompiler` |
+
+For comparison, the GL path: 44 files import `org.lwjgl.opengl` (~9,100 lines, ~590 raw `gl*` calls). 6 live files use `com.mojang.blaze3d.opengl` internals: `GlTexture.glId()` in `LightMapHelper` and `GlAtlasTextureReader`; `GlTextureView.glId()` in `MixinDefaultChunkRenderer` and the nvidium `MixinRenderPipeline`; `GlStateManager` / `GlConst` in `VoxyRenderSystem`; `GlDebug` in `MixinGlDebug`. `BakedBlockEntityModel.java` also casts to `GlTexture`, but the whole file is commented out.
+
+### 3.3 Touchpoint inventory, by fragility
+
+**Tier A — stable public API (low risk)**
+- `RenderSystem.tryGetDevice().getDeviceInfo().backendName()` — `core/vk/MinecraftVkHost.java`
+- `RenderTarget.getColorTextureView()/getDepthTextureView()/width/height` — `core/vk/render/VkRenderCore.java:199`
+- `gameRenderer.levelLightmap()` (`GpuTextureView`) — `core/vk/render/VkFrameHost.java:31`
+- `GpuTexture` atlas handed to `IAtlasTextureReader`; `GpuTextureView.texture().getFormat()`; `GpuSampler` (in a hook signature)
+- `DepthStencilState.DEFAULT`, `CompareOp`, `DeviceInfo.isZZeroToOne()` — `core/RenderProperties.java:62-69` (shared)
+
+**Tier B — public classes of the experimental VK backend (medium risk)**
+- `VulkanDevice.instance().vkInstance() / vkDevice() / graphicsQueue() / createCommandEncoder()` — `core/vk/MinecraftVkHostAdapter.java`
+- `VulkanCommandEncoder.signalSemaphore(…)` — `core/vk/MinecraftVkHostAdapter.java:48`
+- `VulkanGpuTexture.vkImage()`, `VulkanGpuTextureView.vkImageView()`, `VulkanConst.toVk(GpuFormat)` — `core/vk/render/VkFrameHost.java`, `core/vk/VkAtlasTextureReader.java:33`
+- `VulkanFeature`, `VulkanBackend.VK10_FEATURES_STRUCT / VK12_FEATURES_STRUCT`, `VulkanPhysicalDevice.vkPhysicalDevice()` — `core/vk/VkDeviceFeatures.java`
+
+**Tier C — private internals via mixins (high risk; most of these crash the game if they stop matching)**
+- `@Accessor("currentCommandBuffer")` on `VulkanCommandEncoder` — `mixin/vk/AccessorVulkanCommandEncoder.java`
+- `@Inject` at the HEAD of the private static `VulkanBackend.createDevice(Collection, VulkanPhysicalDevice, Set)`, matched by descriptor string — `mixin/vk/MixinVulkanBackend.java` (`require = 0`, so it fails soft)
+- `@Inject` on `VulkanDevice.<init>` TAIL and `close` HEAD — `mixin/vk/MixinVulkanDevice.java`
+- Frame hooks: `Minecraft.renderFrame` HEAD; Sodium `SodiumWorldRenderer.drawChunkLayer` TAIL (`remap = false`)
+- `client.voxy.mixins.json` sets `defaultRequire: 1`, so any Tier C injector without `require = 0` crashes on a mismatch.
+
+**Tier D — unwritten behavioural contracts:** D1–D11 in [§2.3](#23-behaviour-of-mcs-vulkan-backend-that-voxy-depends-on). These break silently, as corruption or validation errors rather than crashes.
+
+### 3.4 Who does what today
+
+| Concern | Blaze3D 26.2 offers | Voxy VK path today | Blaze3D could take it? |
+|---|---|---|---|
+| Instance / device / queue | `VulkanDevice` | adopts MC's (Tier B) | ✅ already |
+| Extra device features | none | mixin into private `createDevice` (C) | ❌ no API — keep the mixin |
+| Frame command buffer | persistent `VulkanCommandEncoder` | records into MC's *current* cmd via private accessor (C) | ✅ via public `allocate…()`+`execute()` → **1.1** |
+| GPU-completion tracking | `createFence()`, `queueFencedTask` | own timeline semaphore + `signalSemaphore` (B) | ✅ public & backend-neutral → **1.2** |
+| Deferred destruction | `queueForDestroy` (B) | own list keyed to the timeline | ✅ → **1.3** |
+| Memory allocation | VMA via `VulkanDevice.vma()` (B) | raw `vkAllocateMemory` per resource, own `findMemoryType` | ✅ → **1.4** |
+| Storage buffers | ❌ | own `VkBuffer` | ❌ (see option O1) |
+| Sampled / attachment textures | `GpuTexture` (2D, GENERAL) | own `VkImage2D` + layout tracking | ✅ atlas, depth-bound, colour → **3.x** |
+| Storage images, D32S8 attachments | ❌ | own `VkImage2D` | ❌ |
+| Samplers | `GpuSampler` + `vkSampler()` | own cache in `VulkanContext` + one in `VkModelStore` | ✅ except the HiZ nearest-mip sampler → **1.5** |
+| GLSL → SPIR-V | MC `GlslCompiler` (vert/frag only) | own `ShadercCompiler` + `VkShaderSource` | ⚠️ only for Blaze3D pipelines |
+| Compute pipelines / dispatch | ❌ | `VkShaderPipeline`, `vkCmdDispatch*` | ❌ |
+| Graphics pipelines | `RenderPipeline` | `VkShaderPipeline` | ⚠️ 2 of 6 today → **4.x** |
+| Descriptors | push descriptors by name (UBO, sampler, texel buffer) | own push-descriptor `Binder` (+SSBO, storage image) | ⚠️ follows the pipeline |
+| Draws | direct / multi / indirect | indexed-indirect**-count**, dispatch-indirect | ⚠️ no indirect-count |
+| Barriers & layouts | implicit, full barrier after every op | fine-grained, manual | ❌ raw work needs its own |
+| Staging uploads | `TransientMemory`, `StagingBuffer` | own `VkUploadStream` | ❌ (targets are storage buffers) |
+| Readbacks | `copyTextureToBuffer` + async callback | `VkDownloadStream`, `VkAtlasTextureReader` | ⚠️ atlas yes → **2.3**; buffer readbacks no |
+| Writing MC's framebuffer | `RenderPass` on `RenderTarget` views | raw dynamic rendering + manual barriers on MC images | ✅ → **4.2** |
+| GPU timing | timestamp query pools | none on VK | ✅ → **2.1** |
+
+---
+
+## 4. What can move, pass by pass
+
+### 4.1 Pipelines
+
+| VK pipeline (file) | Resources used | Blaze3D-expressible on 26.2? |
+|---|---|---|
+| chunk bounds (`VkBoundRenderer`, `chunkoutline/outline.*`) | UBO, **SSBO chunk positions**, depth-only `D32_SFLOAT`, instanced | ✅ **with changes**: positions become an instanced vertex buffer (`VertexFormat.builder(1)`) or a texel buffer; target becomes a Blaze3D `D32_FLOAT` texture; depth-only via `withUnusedColorAttachment()` + `withUnusedColorTargetState(0)` |
+| composite (`VkCompositor.composite`, `post/fullscreen2.vert` + `blit_texture_depth_cutout.frag`) | 2 samplers, 1 std140 UBO, blend = `BlendFunction.TRANSLUCENT`, depth test+write into MC's D32 | ✅ **once its inputs are Blaze3D textures** (colourSSAO is a storage image today; Voxy depth is D32S8) |
+| depth/stencil setup (`VkCompositor.setupDepthStencil`) | sampler, **push constant**, **stencil write**, D32S8 | ❌ (stencil). ✅ if stencil masking goes away (**5.1**); the push constant becomes a UBO |
+| terrain opaque / translucent (`VkTerrainRenderer`, `quads3.vert`/`quads.frag`) | SSBO vertex pulling (geometry up to 2 GB), `shaderInt64`, **indexed-indirect-count**, stencil test, D32S8 | ❌ |
+| raster occlusion cull (`lod/gl46/cull/raster.*`) | fragment shader **writes an SSBO** | ❌ |
+| 13 compute pipelines: prep, cmdgen, prefixsum (`inital3_vk`/`simple`), buildtranslucents, traversal_dev, sort_visibility, result_transformer, batch_visibility_set, scatter, memcpy, hiz_reduce, hiz_subgroup, ssao | SSBOs, storage images, push constants, dispatch(-indirect) | ❌ no compute in Blaze3D |
+
+### 4.2 GL/VK duplicate pairs
+
+Lines per class. ★ marks pairs that a Blaze3D implementation could collapse into one class serving both MC backends.
+
+| GL class | VK twin | Collapsible via Blaze3D? |
+|---|---|---|
+| `BoundRenderer` 143 | `VkBoundRenderer` 165 | ★ step 4.1 |
+| `NormalRenderPipeline` (setup + blit) 168 | `VkCompositor` 313 | ★ composite part, step 4.2 (setup only after 5.1) |
+| `GlAtlasTextureReader` 35 | `VkAtlasTextureReader` 72 | ★ step 2.3 |
+| `GPUTiming` 209 | *(none)* | ★ step 2.1 (VK gains timings) |
+| `ModelStore` 102 | `VkModelStore` 134 | ★ texture half only, step 3.1 |
+| `SSAO` 175 | `VkSSAO` 189 | only if SSAO becomes a fragment pass (5.2) |
+| `HiZBuffer2` 148 | `VkHiZ` 193 | ❌ |
+| `MDICSectionRenderer` 397 | `VkTerrainRenderer` 506 | ❌ |
+| `HierarchicalOcclusionTraverser` 407 | `VkTraversal` 280 | ❌ |
+| `NodeCleaner` 195 | `VkNodeCleaner` 168 | ❌ |
+| `GlNodeGpuOps` 85 | `VkNodeGpuOps` 104 | ❌ |
+| `BasicSectionGeometryData` 179 | `VkSectionGeometryData` 94 | ❌ |
+| `UploadStream` / `DownloadStream` 184 / 177 | `VkUploadStream` / `VkDownloadStream` 167 / 185 | retirement logic only (step 1.2) |
+| `GlBuffer` / `GlTexture` / `Shader` 108 / 164 / 234 | `VkBuffer` / `VkImage2D` / `VkShaderPipeline` 141 / 179 / 330 | partly (1.4, 3.x) |
+| `Capabilities` 223 | `VulkanContext` 238 | vendor/limits part (2.2) |
+| `AbstractRenderPipeline` 283 | `VkRenderCore` 390 | ❌ orchestration |
+
+---
+
+## 5. Roadmap — actionable steps
+
+Every step should land on its own (build, test, commit). Verify each step on both backends:
+- **GL** (Graphics API = Default).
+- **VK** (Graphics API = *Prefer Vulkan*). For validation, add MC's launch flags `--vulkanValidation --renderDebugLabels`; the Khronos validation layer must be installed.
+- **Production jar** in the Modrinth App on the M2 Max (MoltenVK: no `drawIndirectCount`, D32S8). `runClient` isn't enough.
+- A desktop GPU, for the `drawIndirectCount` path.
+
+### Phase 0 — Fence off and document (no behaviour change)
+
+**0.1 Route every Blaze3D-VK internal through the host seam**
+- *Goal:* a version port touches one adapter file plus the vk mixins, and nothing else.
+- *How:*
+  - Extend `IVkHost` with `long vkImage(GpuTexture)`, `long vkImageView(GpuTextureView)`, `int vkFormat(GpuFormat)`, `long vkSampler(GpuSampler)`, `long vma()`, `VkCommandBuffer beginSegment()`/`endSegment(cb)` (for 1.1), and a `lightmapView()` accessor.
+  - Implement them in `MinecraftVkHostAdapter`.
+  - Make `render/VkFrameHost.java` and `VkAtlasTextureReader.java` call the host instead of casting to `VulkanGpuTexture`/`VulkanGpuTextureView`/`VulkanConst`.
+  - Move the `VulkanFeature` / `VulkanBackend.*_FEATURES_STRUCT` references from `VkDeviceFeatures.java` into the mixin or adapter, leaving `VkDeviceFeatures` a plain record of what got enabled.
+- *Done when:* `grep -rl "com.mojang.blaze3d.vulkan" src/main/java` lists only `MinecraftVkHostAdapter` and `mixin/vk/*`.
+
+**0.2 Write the contracts down and assert the cheap ones**
+- *Goal:* a port can't silently violate D1–D11.
+- *How:*
+  - Copy the §2.3 table into `IVkHost`'s header comment.
+  - In `VulkanContext` construction, check `DeviceInfo.underlyingExtensions()` for `VK_KHR_push_descriptor`, `VK_KHR_dynamic_rendering`, `VK_KHR_synchronization2` (D5; entries carry a ` (D)` suffix), and check `isZZeroToOne()`. On failure, report "unsupported" through `VulkanBackend.unsupportedReason` instead of crashing.
+- *Done when:* launching with one assertion forced false shows the unsupported reason in the log, and the game keeps running.
+
+**0.3 Keep this document current.** Update [§2](#2-what-blaze3d-262-actually-provides) and [§7](#7-porting-checklist-per-minecraft-version) on every MC bump.
+
+### Phase 1 — Swap private hooks for the public ones MC itself uses (VK)
+
+**1.1 Record Voxy's frame into its own command buffers, spliced in with `execute()`**
+- *Goal:* delete `AccessorVulkanCommandEncoder`, the only private-field accessor.
+- *How:*
+  - A frame becomes one or more *segments*: `cb = encoder.allocateAndBeginTransientCommandBuffer()` → record → `vkEndCommandBuffer(cb)` → `encoder.execute(cb)`. This is exactly how MC's `VulkanTransientMemory` and `VulkanGpuSurface` inject work.
+  - `execute()` ends MC's current buffer and appends Voxy's to the same submission, so submission order preserves ordering.
+  - Put this in `VkFrameCtx.beginFrame/endFrame` (`core/vk/VkFrameCtx.java:111,118`) and `MinecraftVkHostAdapter.frameCommandBuffer()` (`:39`).
+- *Gotchas:*
+  - (a) Any **Blaze3D** encoder call made during Voxy's frame (a `RenderPass`, `writeTimestamp`, `createTexture`'s init barrier) is recorded into MC's *next* buffer. Close the current segment before a Blaze3D call and open a new one after it. This also enables mixing Blaze3D passes with raw passes in Phase 4.
+  - (b) `execute()` throws inside a render pass (same precondition as today, D3).
+  - (c) The "no frame command buffer at hook point" skip in `VkRenderCore.renderFrame` goes away.
+- *Done when:* the accessor mixin is removed from `client.voxy.mixins.json`, frames look identical, and validation is clean.
+
+**1.2 Frame retirement through public `GpuFence`**
+- *Goal:* drop the Voxy timeline semaphore and `signalSemaphore` (Tier B), and get a retirement mechanism the GL streams can share later.
+- *How:*
+  - At `endFrame`, `fences.add(frameIdx, RenderSystem.getDevice().createCommandEncoder().createFence())`.
+  - `pollRetired()` pops while `fence.awaitCompletion(0)` is true and notifies the listeners (upload recycle, download callbacks).
+  - Hard sync (`waitIdleRetireAll`): after `vkDeviceWaitIdle`, poll again. Never wait with a timeout on the *current* submit, which throws *"Cannot wait on a fence for the current submit"*.
+- *Why public:* `createFence()` is on the backend-neutral `CommandEncoder`, and MC's own `RenderSystem.queueFencedTask` is built on it.
+- *Done when:* `VkFrameCtx` has no semaphore, upload/download streams still recycle and readbacks still fire, and nothing hitches on world unload.
+
+**1.3 Use MC's destruction queue for deferred destroys**
+- *How:* replace `VkFrameCtx.pendingDestroys` (`deferDestroy*`, `:265`) with `encoder.queueForDestroy(() -> …)`. MC destroys them two submits later, which matches D4. At game exit, anything still queued is run by MC's own `commandEncoder.destroy()`. `VulkanDevice.close` calls that before `vkDestroyDevice`, and after `MixinVulkanDevice`'s HEAD hook, so the device is still alive. Re-check that ordering on each port (§7).
+- *Done when:* `PendingDestroy` is deleted and there are no leaks or use-after-free under validation across repeated world join/leave.
+
+**1.4 Allocate through MC's VMA instead of raw `vkAllocateMemory`**
+- *How:*
+  - Add `compileOnly("org.lwjgl:lwjgl-vma:${lwjglVersion}")`. Don't bundle it; MC ships it, like `lwjgl-vulkan`.
+  - `VkBuffer` (`core/vk/VkBuffer.java:51`) and `VkImage2D` call `Vma.vmaCreateBuffer/vmaCreateImage(host.vma(), …)`, mirroring the flags MC uses in `VulkanGpuBuffer.Direct` (AUTO_PREFER_DEVICE, plus host-access flags for mapped buffers).
+  - Delete `VulkanContext.findMemoryType` and the memory-properties cache.
+- *Bonus:* `vmaGetHeapBudgets` gives the VK path real memory budgets for `VkRenderCore.geometryCapacity` (`:180`), which only the GL path has today via `Capabilities`.
+- *Risk:* the 2 GB geometry buffer has to get a dedicated allocation. VMA does this automatically for large sizes, but check it with `vmaGetAllocationInfo`.
+
+**1.5 (optional) Samplers from Blaze3D**
+- Use `GpuDevice.createSampler`/`RenderSystem.getSamplerCache()` plus `host.vkSampler()` for the nearest/linear samplers and the model-atlas sampler.
+- The atlas sampler matches Blaze3D's mapping: NEAREST min/mag, `maxLod = LAYERS-1` ⇒ LINEAR mip.
+- The HiZ nearest-mip sampler can't be expressed (§2.1) and stays raw.
+- Low value: do it only if touching those files anyway.
+
+### Phase 2 — Backend-neutral utilities on the public API (benefit GL and VK)
+
+**2.1 GPU timing on Blaze3D queries.** Re-implement `core/util/GPUTiming.java` with `GpuDevice.createTimestampQueryPool`, `CommandEncoder.writeTimestamp` and `DeviceInfo.timestampPeriod()`. The VK path gets frame timings it has never had, and GL query code goes away. On VK, timestamps are recorded into MC's buffer, so place them between segments (1.1).
+
+**2.2 Vendor/limits from `DeviceInfo`.** In shared code that only needs vendor or limits, prefer `DeviceInfo.vendorName()/name()/type()/limits()` over `Capabilities.isNvidia/isAmd/isIntel`. Keep GL-only probes, such as the broken-depth-sampler and memory queries, GL-only.
+
+**2.3 Atlas readback via Blaze3D (VK first)**
+- *How:*
+  - `buf = device.createBuffer(label, MAP_READ|COPY_DST, w*h*4)`, then `encoder.copyTextureToBuffer(atlas, buf, 0, callback, 0)`, then map and read in the callback.
+  - The callback is **asynchronous on both backends**: on VK it runs after 2 submits via `queueForDestroy`; on GL, via `RenderSystem.queueFencedTask`.
+  - `ModelBakerySubsystem` therefore has to accept the atlas arriving 1–3 frames after construction.
+- *Payoff:* it removes the last reason for Voxy's synchronous `vkQueueSubmit` on MC's queue (D6) apart from init fills, which 1.1 segments can absorb.
+- *Caution:* upstream's `GlAtlasTextureReader` (`core/model/bakery/GlAtlasTextureReader.java:21`) deliberately avoids Blaze3D (*"doing it with b3d has some issues"*). Ship the VK side first and only replace the GL side after reproducing and understanding that issue.
+
+### Phase 3 — Create textures through Blaze3D, keep binding them raw
+
+**3.1 Model atlas as a `GpuTexture`**
+- *How:*
+  - `createTexture(USAGE_TEXTURE_BINDING|USAGE_COPY_DST, RGBA8_UNORM, w, h, 1, LAYERS)`, then `CommandEncoder.writeToTexture(tex, buf, mip, 0, x, y, w, h)` per mip.
+  - Bind raw with `host.vkImageView(view)` in layout `GENERAL` (D1) on VK, and `glId()` on GL.
+  - Delete the upload/transition half of `VkModelStore` and the GL `ModelStore` texture code.
+  - Uploads go through MC's per-submit `TransientMemory`, so check peak per-frame upload size during heavy baking.
+- *Gotcha:* the texture's init barrier is recorded into MC's current buffer at creation, so create it outside a Voxy segment (1.1).
+
+**3.2 Depth-bound and main colour targets as `GpuTexture`s**
+- *How:*
+  - `depthBound`: `D32_FLOAT`, `RENDER_ATTACHMENT|TEXTURE_BINDING`.
+  - `colour`: `RGBA8_UNORM`, `RENDER_ATTACHMENT|TEXTURE_BINDING`.
+  - These stay in `GENERAL`, so stop transitioning them in `VkViewport`/`VkCompositor`/`VkBoundRenderer`.
+- *Stay raw:* `colourSSAO` (storage) until 5.2; `depthStencil` (D32S8, and MC's init barrier only covers the depth aspect); the HiZ pyramid (storage, per-mip storage views).
+- *Prerequisite for:* 4.1 and 4.2.
+
+### Phase 4 — Blaze3D render passes
+
+**4.1 Pilot: chunk-bounds renderer as one Blaze3D pass for both backends**
+- *Shader:*
+  - Port `chunkoutline/outline.vsh/.fsh` to MC's dialect: `#version 330`, a named std140 block, and a **per-instance vertex attribute** for the chunk position instead of the `ChunkPosBuffer` SSBO.
+  - Ship it as `assets/voxy/shaders/core/<name>.vsh/.fsh`. MC's `ShaderManager` lists `shaders/` in every namespace, so the default `ShaderSource` finds it as `voxy:core/<name>`. Don't depend on `precompilePipeline(pipeline, customSource)`: `ShaderManager` calls `clearPipelineCache()` on resource reload, and the pipeline then recompiles from the default source.
+- *Pipeline:*
+  - `DepthStencilState(reverseZ ? LESS_THAN : GREATER_THAN, true)` (the "further" test).
+  - No colour: `withUnusedColorTargetState(0)`.
+  - `TRIANGLES`, cull off, `withVertexBinding(0, instanceFormat)` using `VertexFormat.builder(1)`.
+- *Pass:*
+  - `RenderPassDescriptor.withUnusedColorAttachment().withDepthAttachment(depthBoundView, inverseClearDepth)`.
+  - The index buffer is a `GpuBuffer(USAGE_INDEX)` of the 36 cube indices.
+  - The `StreamedBoundStore` storage becomes `GpuBuffer(USAGE_VERTEX|USAGE_COPY_DST)` filled via `writeToBuffer`/`TransientMemory`.
+- *Done when:* `BoundRenderer` and `VkBoundRenderer` are replaced by one class, and LOD fragments behind vanilla terrain are still discarded on GL, VK and MoltenVK.
+- *Why first:* it's small (about 150 lines), self-contained, depth-only, and proves the whole toolchain: MC-dialect shaders, custom `ShaderSource`, Blaze3D textures bound raw elsewhere, and segment splicing.
+
+**4.2 Composite pass into MC's framebuffer via Blaze3D**
+- *How:*
+  - `RenderPipeline`: `fullscreen` vert + `blit_texture_depth_cutout` frag, ported to MC dialect.
+  - Blend `BlendFunction.TRANSLUCENT`, which equals today's `SRC_ALPHA/ONE_MINUS_SRC_ALPHA/ONE/ONE_MINUS_SRC_ALPHA`.
+  - Depth closer-or-equal plus write, `TRIANGLE_STRIP` with 4 vertices.
+  - Samplers `depthTex`, `colourTex`; UBO `CompositeParams`; colour target format taken from MC's colour view.
+  - The render pass targets `RenderTarget.getColorTextureView()/getDepthTextureView()`.
+- *Prerequisites:* the sampled colour must be a Blaze3D texture (needs 5.2) and the sampled depth must be one too (needs 5.1, or a D32 depth copy).
+- *Payoff:* the one pass that writes MC's framebuffer follows MC's layouts, barriers and formats automatically, including a future HDR main target. It also deletes `VkFrameHost.mcImageBarrier` and the GL blit.
+
+### Phase 5 — Research and decisions that unlock more
+
+**5.1 Stencil-free LOD masking**
+- *Today:* setup writes stencil 0 where vanilla depth exists, and terrain draws require stencil == 1.
+- *Alternative:* at vanilla pixels, write the *nearest* depth value, so every LOD fragment fails the closer-or-equal test there. The effect is the same with no stencil.
+- *Evaluate:*
+  - (a) HiZ/traversal: nodes hidden behind vanilla get culled, which should be harmless because they were masked anyway.
+  - (b) SSAO halos at the vanilla/LOD seam.
+  - (c) Translucent LODs.
+- *If viable:* Voxy depth becomes `D32_FLOAT` (Blaze3D-creatable), the setup pass becomes Blaze3D-expressible (its push constant becomes a UBO), and 4.2's depth input is unblocked.
+
+**5.2 SSAO as a fullscreen fragment pass.** Drops the storage-image requirement on `colourSSAO` (needed for 3.2 and 4.2) and makes `SSAO`/`VkSSAO` collapsible. Needs a performance comparison against compute on desktop and on the M2 Max.
+
+**5.3 Long-term fate of the GL backend (your call).** MC 26.2 defaults to OpenGL, so GL stays essential for now. Every Phase 4 pass removes one GL/VK pair, but the compute core needs two implementations for as long as GL is supported. Revisit when Mojang makes Vulkan the default.
+
+### Options considered but not recommended yet
+
+- **O1 — Storage usage through Blaze3D.** Two tiny mixins on `VulkanConst.bufferUsageToVk` / `textureUsageToVk` could map a Voxy-only usage bit to `STORAGE_BUFFER`/`STORAGE_IMAGE`. That would let *all* Voxy resources be created via `GpuDevice` (VMA, labels, deferred destroy) on both backends, while still being bound raw. It adds new Tier C coupling, so only reach for it if 1.4 + 3.x still leave too much custom resource code.
+- **Texel buffers instead of SSBOs in raster shaders.** The terrain geometry buffer (up to 2 GB) exceeds `maxTexelBufferElements` on many devices, so this doesn't work for terrain. It *does* work for small inputs like chunk positions (alternative to the instanced attribute in 4.1).
+- **Hooking MC's frame graph instead of Sodium.** Sodium cancels vanilla `renderGroup` at HEAD (D11), so Voxy has to run after Sodium's opaque draw. The Sodium hook stays.
+
+### Stays raw Vulkan until Blaze3D grows (26.2 blockers)
+
+| Work | Missing Blaze3D feature |
+|---|---|
+| All 13 compute pipelines | compute pipelines / dispatch |
+| Terrain opaque/translucent/temporal draws | storage buffers in VS/FS, indirect-count, stencil, D32S8 attachments, `shaderInt64` |
+| Raster occlusion cull | fragment-shader storage writes |
+| Geometry, metadata, node, visibility, draw-command buffers | storage-buffer usage |
+| HiZ pyramid | storage images + nearest-mip sampling |
+| Extra device features (`MixinVulkanBackend`) | no API to request features; the mixin is unavoidable |
+
+---
+
+## 6. Watchlist — Blaze3D features that would unlock more
+
+Run these against freshly decompiled sources on every MC bump. Any hit means a row in the table above may move.
+
+```bash
+B=/tmp/mc-src/com/mojang/blaze3d
+grep -n "COMPUTE" $B/shaders/ShaderType.java                                   # compute shaders
+grep -n "STORAGE" $B/buffers/GpuBuffer.java $B/textures/GpuTexture.java $B/shaders/UniformType.java
+grep -in "stencil" $B/pipeline/DepthStencilState.java                          # stencil state
+grep -in "indirectcount\|dispatch" $B/systems/RenderPass.java $B/systems/CommandEncoder.java
+grep -n "not yet supported" $B/systems/GpuDevice.java $B/systems/CommandEncoder.java  # array textures
+grep -n "depthAttachmentFormat\|stencilAttachmentFormat" $B/vulkan/VulkanRenderPipeline.java
+grep -n "pushConstant\|PushConstant" -r $B/pipeline $B/systems
+```
+
+---
+
+## 7. Porting checklist (per Minecraft version)
+
+1. `./gradlew genSources`, then extract `com/mojang/blaze3d` ([§1](#1-how-this-was-checked-and-how-to-re-check)).
+2. **Tier C hooks.** Confirm that the following still exist with the same shape; mismatches crash the game (`defaultRequire: 1`), except `MixinVulkanBackend`:
+   - `VulkanCommandEncoder.currentCommandBuffer` (until 1.1 removes it)
+   - `VulkanBackend.createDevice(Collection, VulkanPhysicalDevice, Set)`
+   - `VulkanDevice.<init>` / `close`
+   - `Minecraft.renderFrame`
+   - Sodium `SodiumWorldRenderer.drawChunkLayer(ChunkSectionLayerGroup, ChunkRenderMatrices, double, double, double, GpuSampler)`, and on the GL path `DefaultChunkRenderer.render`
+3. **Tier B getters.** Confirm `VulkanDevice.{instance,vkDevice,graphicsQueue,createCommandEncoder,vma}`, `VulkanCommandEncoder.{signalSemaphore,execute,allocateAndBeginTransientCommandBuffer,queueForDestroy}`, `VulkanGpuTexture.vkImage`, `VulkanGpuTextureView.vkImageView`, `VulkanGpuSampler.vkSampler`, `VulkanConst.toVk(GpuFormat)`, `VulkanFeature`, and `VulkanBackend.VK10/VK12_FEATURES_STRUCT`.
+4. **Tier D contracts.** Re-read the code behind D1–D11:
+   - `VulkanGpuTexture` constructor (layout)
+   - `VulkanCommandEncoder.memoryBarrier` and its callers
+   - `VulkanCommandEncoder.submit` (in-flight count)
+   - `VulkanBackend.REQUIRED_DEVICE_EXTENSIONS/FEATURES`
+   - `VulkanRenderPipeline.compile` (depth format)
+   - `GameRenderer.levelLightmap`
+   - the block atlas creation usage flags
+   - `DepthStencilState.DEFAULT`
+5. **Public API churn.** Diff `CommandEncoder`, `RenderPass`, `RenderPipeline`, `GpuDevice`, `GpuBuffer`/`GpuTexture` usage constants, `BindGroupLayout` and `DeviceInfo` against the previous version.
+6. Run the watchlist in §6 and update §4/§5 if anything unlocked.
+7. **Test:**
+   - GL (Default) and VK (Prefer Vulkan) with `--vulkanValidation`.
+   - The built jar in the Modrinth App on the M2 Max (MoltenVK).
+   - A desktop GPU with `drawIndirectCount`.
+   - World join/leave twice and a resource-pack reload (renderer re-creation and atlas readback).
+
+---
+
+## 8. Open questions for you
+
+1. **Should the GL backend ever go?** (5.3) Phase 4 is worth more if GL stays, since each pass is written once for both backends. If GL is going away, VK-only cleanups become just as good.
+2. **Is an async atlas readback acceptable?** (2.3) LODs would appear 1–3 frames later after world load or a resource reload.
+3. **Is a temporary visual difference at the vanilla/LOD seam acceptable** while evaluating stencil-free masking (5.1)?
+4. **Tolerance for new internal mixins:** is O1 acceptable if it deletes a lot of custom resource code, or is "fewest Blaze3D-internal hooks" the priority?
+
+---
+
+## Appendix A — VK path file inventory
+
+| File (under `client/`) | Lines | Blaze3D usage (tier) | What it does itself | Step |
+|---|---|---|---|---|
+| `core/vk/IVkHost.java` | 34 | — | host seam | 0.1 |
+| `core/vk/MinecraftVkHost.java` | 38 | `RenderSystem.tryGetDevice` (A) | detects MC-on-Vulkan | — |
+| `core/vk/MinecraftVkHostAdapter.java` | 53 | `VulkanDevice`, `VulkanCommandEncoder` (B, C) | handles, frame cmd, semaphore signal | 0.1, 1.1, 1.2 |
+| `core/vk/VulkanBackend.java` | 71 | — | adoption lifecycle | — |
+| `core/vk/VulkanContext.java` | 238 | — | caps (subgroups, limits, formats), cmd pool, pipeline cache, samplers, set-layout cache, memory types | 1.4, 1.5 |
+| `core/vk/VkDeviceFeatures.java` | 97 | `VulkanFeature`, `VulkanBackend` statics (B) | extra feature request/record | 0.1 |
+| `core/vk/VkFrameCtx.java` | 337 | via `IVkHost` | recording target, retirement, deferred destroy, barriers, immediate submit | 1.1–1.3 |
+| `core/vk/VkBuffer.java` | 141 | — | buffer + dedicated memory | 1.4 |
+| `core/vk/VkImage2D.java` | 179 | — | image + memory + views + layout tracking | 1.4, 3.x |
+| `core/vk/VkShaderPipeline.java` | 330 | — | compute+graphics pipelines, push descriptors/constants, stencil | stays (compute); 4.x replaces two graphics users |
+| `core/vk/ShadercCompiler.java` | 55 | — | GLSL→SPIR-V incl. compute | stays |
+| `core/vk/VkShaderSource.java` | 98 | — | `#import` expansion, version forcing, define injection | stays |
+| `core/vk/VkUploadStream.java` | 167 | — | persistently mapped staging + arena | 1.2 |
+| `core/vk/VkDownloadStream.java` | 185 | — | readback arena + callbacks | 1.2 |
+| `core/vk/VkAtlasTextureReader.java` | 72 | `GpuTexture` (A), `VulkanGpuTexture` (B) | image→buffer copy + immediate submit | 0.1, 2.3 |
+| `core/vk/VkCmd.java`, `VkUtil.java` | 42, 13 | — | helpers | — |
+| `core/vk/render/VkRenderCore.java` | 390 | `RenderTarget` (A) | orchestration, resource ownership | 1.1 |
+| `core/vk/render/VkFrameHost.java` | 63 | `GpuTextureView` (A); `VulkanGpuTexture/View`, `VulkanConst` (B) | MC handle extraction, barriers on MC images | 0.1, 4.2 |
+| `core/vk/render/VkTerrainRenderer.java` | 506 | — | prep/cmdgen/prefix/translucent compute, raster cull, terrain indirect(-count) draws | stays |
+| `core/vk/render/VkTraversal.java` | 280 | — | hierarchical traversal compute | stays |
+| `core/vk/render/VkNodeCleaner.java` | 168 | — | cleaner compute | stays |
+| `core/vk/render/VkNodeGpuOps.java` | 104 | — | scatter / multi-memcpy compute | stays |
+| `core/vk/render/VkHiZ.java` | 193 | — | HiZ pyramid compute | stays |
+| `core/vk/render/VkSSAO.java` | 189 | — | SSAO compute | 5.2 |
+| `core/vk/render/VkCompositor.java` | 313 | `GpuTextureView` (A) | stencil setup + composite into MC target | 4.2, 5.1 |
+| `core/vk/render/VkBoundRenderer.java` | 165 | — | depth-only instanced chunk-bound raster | 4.1 |
+| `core/vk/render/VkModelStore.java` | 134 | — | model/colour SSBOs + atlas upload | 3.1 |
+| `core/vk/render/VkViewport.java` | 113 | — | per-viewport buffers + offscreen targets | 3.2 |
+| `core/vk/render/VkSectionGeometryData.java` | 94 | — | geometry + metadata buffers | 1.4 |
+| `mixin/vk/AccessorVulkanCommandEncoder.java` | 16 | private field (C) | — | delete in 1.1 |
+| `mixin/vk/MixinVulkanBackend.java` | 35 | private method (C) | feature request | 0.1 (keep) |
+| `mixin/vk/MixinVulkanDevice.java` | 60 | ctor/close (C) | host register/teardown | keep |
+| `mixin/vk/MixinMinecraftFrameStart.java` | 30 | `Minecraft.renderFrame` | deferred renderer creation | keep |
+| `mixin/vk/MixinSodiumOpaqueVkFrame.java` | 46 | Sodium internal | frame entry point | keep |
