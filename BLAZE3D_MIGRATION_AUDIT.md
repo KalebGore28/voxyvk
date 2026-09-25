@@ -60,7 +60,7 @@ Work happens on the branch `blaze3d-migration`, off `vulkan-audit-fixes`. Everyt
 | 2.3 follow-up: drop deferred VK renderer creation | Decided: keep it (see [2.3](#phase-2--small-pieces-onto-the-public-blaze3d-api-vk-first)) | |
 | 4.1 Chunk-bounds pass on Blaze3D (with 3.2 for the depth-bound target) | Done, tested in-game (0.2.23) | `9a06f6d2` |
 | 1.5 (optional) Samplers from Blaze3D | Not started; do it together with 3.1, which touches the atlas sampler anyway | |
-| 3.2 LOD colour target as a Blaze3D texture | Done, needs in-game testing (0.2.23) | see git log |
+| 3.2 LOD colour target as a Blaze3D texture | Done, needs in-game testing (0.2.23) | `89936c68` |
 | 3.2 `depthStencil` (needs `separateDepthStencilLayouts`, see 4.2), `colourSSAO` (needs 5.2); 3.1, 4.2, Phase 5 | Not started; 4.2 deferred by the user (2026-09-25), easiest steps first | |
 
 In-game checks for the finished steps:
