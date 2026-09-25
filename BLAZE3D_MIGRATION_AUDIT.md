@@ -110,13 +110,23 @@ Performance is a co-priority of the migration: a step that makes the VK path slo
 
   At 70 fps a frame lasts about 14 ms, so in the vista Voxy's GPU work is most of the frame: the game is GPU-bound there.
 
+  | Same spot after spyglass tests, SSAO auto; 3,850 of 4,095 MB geometry (the cleaner is about to evict), 307k nodes (jar `cff6763`) | 51 now, p50 41 / p98 21 | 17.2 ms | `I` 13.86, `ao` 1.35, `comp` 0.82, `hiz` 0.61, `CG` 0.41 | O 32,315/73,124 short 4, T 0/256 short 40, X 4,343/7,851 short 4 |
+
   The second row exposed the 8 s any-direction hold of `e0c6544d`. After a quick turn the temporal pass had briefly drawn about 42k sections, and every pass then kept its peak: 176k Metal draws per frame, 133k of them empty. `ao` rose although SSAO's samples were halved, because on Apple GPUs it also absorbs the temporal pass, here 63,745 empty draws. That puts an empty draw's GPU cost somewhere around 20–25 ns, before MoltenVK's CPU encoding. `cff6763e` sizes the budgets by view direction; a simulation of the same view gives 47k opaque slots instead of 99k.
+
+  The third row confirms it: `ao` halved (2.71 → 1.35 ms) once the temporal pass lost its 63k empty draws, so those cost about 1.3 ms of GPU per frame. But the temporal pass then fell short on nearly every spyglass exit: each step of an FOV change re-picks the LOD of the whole view, not just the widening edges. The opaque budget also kept zoomed-in counts for the normal view. `e299f3c9` makes the budgets FOV-aware (see Known costs above). A frame-by-frame simulation of MC's FOV easing gives no shortfalls on spyglass exits, quick turns or pans.
 - **Next measurements** (same spot, one change at a time, compare the total):
   1. Shrink the window to about half width and height. If the total drops by half or more, per-pixel work (LOD fragments, SSAO, HiZ, composite) dominates; if it barely moves, per-draw and per-vertex work does.
   2. SSAO `best` → `auto` (12 spp at this size) or `basic`.
   3. `-Dvoxy.vk.drawBudgetGrowth=1.0` (default 1.25 since `cff6763e`) shows what the remaining empty draws cost (watch `short` for dropped sections).
 - **Known costs on MoltenVK (the M2 Max):**
-  - MoltenVK has no indirect-count draws, so every budget slot is one Metal draw, empty ones included, encoded on the render thread inside MC's submit. Since `cff6763e` the budget is sized by view direction: counts from the last 8 s within 30° of the list being drawn (or from anywhere right after a quick turn into a new view), × 1.25, plus headroom (1024 opaque, 256 temporal/translucent). The temporal pass is sized from the turn and FOV change since the last list. `-Dvoxy.vk.drawBudgetGrowth` overrides the 1.25.
+  - MoltenVK has no indirect-count draws, so every budget slot is one Metal draw, empty ones included, encoded on the render thread inside MC's submit. Since `cff6763e` and `e299f3c9` the budget is sized by view:
+    - Counts from the last 16 s taken within 30° of the list's direction and within 10% of its FOV.
+    - Right after a quick turn into a new view, or while the FOV changes, the largest count from any view instead.
+    - Then × 1.25, plus headroom (1024 opaque, 256 temporal/translucent).
+    - The temporal pass is sized from the turn since the last list, or covers the whole view while the FOV changes.
+    - `-Dvoxy.vk.drawBudgetGrowth` overrides the 1.25.
+  - The geometry buffer is one storage-buffer binding, so it can't pass `maxStorageBufferRange`: 4 GiB − 1 on MoltenVK, and at most 4 GiB on any Vulkan device. At a section render distance of 64 a large world fills it, and the cleaner then evicts least-recently-rendered sections below 256 MB free, as on GL. Going further would take splitting the geometry over several bindings, or buffer device addresses.
   - Since `719c29c1` the geometry buffer is about 4 GiB instead of 2 GB, so more detail stays resident and is drawn. That costs frames, but it is what GL does too.
 - **Rules for the remaining steps:**
   - Every Blaze3D encoder operation ends with a full barrier (D2). Don't route per-item work through Blaze3D calls without batching it: for example 3.1's model-atlas uploads, which would be one `writeToTexture` per region. Compare `GpuTime` before and after.
